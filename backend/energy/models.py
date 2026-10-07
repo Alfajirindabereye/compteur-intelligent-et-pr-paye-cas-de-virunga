@@ -64,6 +64,9 @@ class Recharge(models.Model):
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_APPLIED)
     applied_at = models.DateTimeField(null=True, blank=True)
     synced_at = models.DateTimeField(auto_now_add=True)
+    # Instant où le crédit a été transmis au compteur (réponse de télémétrie).
+    # Tant qu'il est nul, le solde local du compteur n'inclut pas encore cette recharge.
+    delivered_at = models.DateTimeField(null=True, blank=True)
     provider_reference = models.CharField(max_length=128, blank=True)
 
 
@@ -118,7 +121,7 @@ class RelayCommand(models.Model):
     acknowledged_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        ordering = ["-created_at"]
+        ordering = ["-created_at", "-id"]
 
 
 class NewsArticle(models.Model):

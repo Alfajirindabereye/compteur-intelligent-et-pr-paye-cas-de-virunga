@@ -153,3 +153,40 @@
 - [x] Dashboard abonné : deux camemberts SVG (zéro dépendance) « Consommation journalière » et « Consommation hebdomadaire » avec légende kWh/%, total au centre et badge DONNÉES DEMO en mode démo
 - [x] Seed simulateur étendu à 7 jours (168 points) avec profil jour/nuit + boost week-end, et RATTRAPAGE de l'état réel du compteur (énergie cumulée et balance finissent à la valeur actuelle, le temps réel reprend à la suite) — corrige le jour courant aberrant (mélange seed/temps réel)
 - [x] Tests : +2 Django (agrégations déterministes + contrat API) → 32/32 ; +1 Vitest (rendu des donuts et totaux) → 16/16
+
+## Correctifs du 07/10/2026 (relecture complète du dépôt)
+
+- [x] Démarrage : suppression de `import pymysql` dans `backend/config/__init__.py` (paquet absent de `requirements.txt` → aucune commande `manage.py` ne se lançait, Docker compris)
+- [x] Django 5.2 / DRF 3.16 (Django 5.1 n'est plus maintenu et plante sous Python 3.14) ; `daphne` dans `INSTALLED_APPS` pour que `runserver` serve aussi le WebSocket
+- [x] Recharge écrasée : la télémétrie suivante remplaçait le solde serveur par le solde local du compteur. Les crédits non transmis sont ajoutés et renvoyés au compteur (`credit_kwh`, champ `Recharge.delivered_at`, migration 0006)
+- [x] Commande relais de l'abonné : elle n'était jamais envoyée au compteur et la règle de solde l'annulait. Elle part dans `relay_command` et l'isolement tient jusqu'au rétablissement demandé ; rétablissement refusé (409) à solde nul
+- [x] Simulateur : applique `credit_kwh` et `relay_command`, ne consomme plus relais ouvert, redémarre dans l'état connu du backend
+- [x] Paiements — crédit gratuit possible : `/api/payments/flutterwave/verify/?status=successful` et le callback PawaPay créditaient sans preuve. Confirmation serveur à serveur obligatoire (statut, référence, montant, devise) ; webhook Flutterwave contrôlé sur le montant
+- [x] PawaPay : `depositId` au format UUID (exigé par l'API), dépôt refusé marqué FAILED, le polling de statut s'arrête quand le callback a déjà crédité
+- [x] `POST /api/budget/` renvoyait 500 (`detect_anomalies` appelé sans télémétrie)
+- [x] JWT : un refresh token (7 jours) était accepté comme jeton d'accès ; clé par défaut connue remplacée par une clé aléatoire hors mode debug ; `.env` chargé avant la lecture de `DJANGO_SECRET_KEY` / `DJANGO_DEBUG` / `DJANGO_ALLOWED_HOSTS`
+- [x] Token revendeur : la réponse affichait l'ancien solde ; marquage et crédit dans la même transaction ; numéro de recharge sur le reçu PDF
+- [x] Frontend : suppression du faux jeton `token-session-…`, « Coût estimé aujourd'hui » calculé sur la consommation (affichait le solde), « Dernière communication » réelle, retrait des chiffres inventés (disponibilité 99,8 %, latence 39 ms), reconnexion automatique par le cookie `vse_refresh`, déconnexion qui efface ce cookie
+- [x] Dépôt : `__pycache__` et le raccourci Windows retirés du suivi Git, `backend/.env.example`, README complété
+- [x] Tests : Django 53/53 (+12), Vitest 18/18 (+2), `tsc --noEmit` sans erreur ; essai de bout en bout serveur + simulateur (recharge conservée, relais OFF/ON exécuté par le compteur)
+
+## Points restants traités le 07/10/2026 (suite)
+
+- [x] Connexion administrateur Django : `POST /api/auth/admin/login/` (compte `is_staff` créé par `createsuperuser`, limité à 10 essais/minute), jeton `domain_role=administrateur` honoré seulement si le compte est réellement administrateur
+- [x] Page `/admin` refaite sur l'API Django (elle dépendait de l'ancienne authentification Node) : connexion, supervision réelle actualisée toutes les 15 s, alertes ouvertes, émission de token revendeur
+- [x] Crédit au compteur fiabilisé : la réponse de télémétrie liste les crédits (`credits`) tant que le compteur ne les a pas accusés (`credit_acks`) — plus de perte si une réponse s'égare, pas de double crédit
+- [x] Modèle DeepSeek par défaut : `deepseek-flash` (l'ancien nom `deepseek-v4-flash-vision-exp` est retiré)
+- [x] Tests : Django 54/54, Vitest 20/20 (+2 pour la page administrateur), `tsc --noEmit` sans erreur
+
+## Mission débogage & UI/UX du 07/10/2026
+
+- [x] Connexion : lecture défensive de la réponse (`?.`), plus de `Cannot read properties of undefined (reading 'first_name')` ; contrat `/api/auth/subscriber/login/` vérifié par test (`access_token` + `subscriber.first_name/last_name/meter_id`)
+- [x] Session : toutes les requêtes abonné passent par `authorizedFetch` (en-tête `Authorization: Bearer`), renouvellement automatique sur 401 par le cookie `vse_refresh` ; l'API répond désormais 401 (et non 403) à un jeton expiré
+- [x] Modal de connexion compact et centré (la classe `sm:max-w-lg` du composant l'emportait sur `max-w-md`), Nom/Prénom côte à côte, validation par Entrée
+- [x] Graphiques : courbe lissée à dégradé et halo, infobulles au survol/toucher (LiveChart, WeeklyBars), jauge colorée selon le niveau de crédit, animations d'apparition
+- [x] Carrousel animé (fondu, défilement automatique suspendu au survol, puces de navigation) ; effet d'onde lumineuse au clic sur tous les boutons (`useButtonRipple`, désactivé si « réduire les animations »)
+- [x] Boutons : « Voir le rapport » télécharge le rapport CSV, « Voir tout » déplie les alertes, « Marquer lue » acquitte via `POST /api/alerts/<id>/ack/`, chaque entrée du menu latéral pointe vers son panneau ; un test vérifie qu'aucun bouton du tableau de bord n'est sans action
+- [x] Alertes dégressives 15 / 10 / 5 / 3 / 1 % (`CREDIT_SEUIL_<n>`), une par seuil et par cycle de recharge, sans changement de base de données
+- [x] Notifications e-mail (Gmail SMTP), SMS (Twilio) et WhatsApp (Twilio ou Meta Cloud API) dans `energy/notifications.py`, envoyées hors du fil de la télémétrie ; canal non configuré = signalé, jamais simulé
+- [x] Tableau de bord : carte « Niveau de crédit » avec les seuils franchis, panneau « Alertes de crédit » (coordonnées via `/api/profile/`, état des canaux, message d'essai via `/api/notifications/test/`) ; les alertes critiques s'affichent enfin en rouge (`CRITICAL` n'était pas reconnu)
+- [x] Tests : Django 58/58, Vitest 22/22, `tsc --noEmit` sans erreur, build de production réussi

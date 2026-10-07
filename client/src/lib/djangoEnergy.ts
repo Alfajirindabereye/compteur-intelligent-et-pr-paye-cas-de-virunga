@@ -21,6 +21,7 @@ export type DjangoSnapshot = {
   };
   balance: { kwh: number; cdf: number; usd: number };
   cdf_per_usd?: number;
+  tariff?: { cdf_per_kwh: number; usd_per_kwh: number };
   estimate_hours: number;
   consumption: Array<{
     label: string;
@@ -33,7 +34,15 @@ export type DjangoSnapshot = {
     date?: string;
     kwh: number;
   }> | null;
+  credit?: {
+    percent: number | null;
+    reference_kwh: number;
+    threshold: number | null;
+    thresholds: number[];
+  };
+  notifications?: Record<NotificationChannel, ChannelState>;
   alerts: Array<{
+    id?: number;
     kind: string;
     severity: string;
     message: string;
@@ -55,6 +64,9 @@ export type DjangoSnapshot = {
     status: "PENDING" | "APPLIED" | "SUPERSEDED";
   } | null;
 };
+
+export type NotificationChannel = "email" | "sms" | "whatsapp";
+export type ChannelState = "ready" | "no_contact" | "not_configured";
 
 export type SubscriberLogin = {
   firstName: string;
@@ -153,6 +165,32 @@ async function parseJson<T>(response: Response): Promise<T> {
   return content;
 }
 
+type AuthResponse = {
+  access_token?: string;
+  subscriber?: { first_name?: string; last_name?: string; meter_id?: string };
+};
+
+// Lecture défensive de la réponse d'authentification : un corps inattendu (proxy,
+// ancienne version du serveur…) produit un message clair plutôt qu'un
+// « Cannot read properties of undefined (reading 'first_name') ».
+function toSession(
+  data: AuthResponse | null | undefined,
+  fallback?: { firstName: string; lastName: string }
+): SubscriberSession {
+  if (!data?.access_token)
+    throw new Error("Réponse de connexion incomplète : jeton d'accès absent.");
+  const session: SubscriberSession = {
+    accessToken: data.access_token,
+    subscriber: {
+      firstName: data.subscriber?.first_name ?? fallback?.firstName ?? "",
+      lastName: data.subscriber?.last_name ?? fallback?.lastName ?? "",
+      meterId: data.subscriber?.meter_id ?? "",
+    },
+  };
+  sessionStorage.setItem(SUBSCRIBER_TOKEN_KEY, session.accessToken);
+  return session;
+}
+
 export async function loginSubscriber(
   input: SubscriberLogin
 ): Promise<SubscriberSession> {
@@ -170,24 +208,7 @@ export async function loginSubscriber(
     credentials: "include",
     body: JSON.stringify(body),
   });
-  const data = await parseJson<{
-    access_token: string;
-    subscriber: { first_name: string; last_name: string; meter_id: string };
-  }>(response);
-
-  // MODIFICAION
-  const token = data.access_token || "token-session-" + Date.now();
-  // token au lieu de data.access_token
-  const session = {
-    accessToken: token,
-    subscriber: {
-      firstName: data.subscriber.first_name,
-      lastName: data.subscriber.last_name,
-      meterId: data.subscriber.meter_id,
-    },
-  };
-  sessionStorage.setItem(SUBSCRIBER_TOKEN_KEY, session.accessToken);
-  return session;
+  return toSession(await parseJson<AuthResponse>(response), input);
 }
 
 // Reconnexion automatique : le cookie persistant vse_refresh (HTTP-only) permet de
@@ -199,20 +220,38 @@ export async function refreshSubscriberSession(): Promise<SubscriberSession> {
     credentials: "include",
     body: JSON.stringify({}),
   });
-  const data = await parseJson<{
-    access_token: string;
-    subscriber: { first_name: string; last_name: string; meter_id: string };
-  }>(response);
-  const session = {
-    accessToken: data.access_token,
-    subscriber: {
-      firstName: data.subscriber.first_name,
-      lastName: data.subscriber.last_name,
-      meterId: data.subscriber.meter_id,
-    },
-  };
-  sessionStorage.setItem(SUBSCRIBER_TOKEN_KEY, session.accessToken);
-  return session;
+  return toSession(await parseJson<AuthResponse>(response));
+}
+
+let pendingRefresh: Promise<SubscriberSession> | null = null;
+
+// Toute requête abonné passe ici : le jeton le plus récent est envoyé en
+// « Authorization: Bearer … » et, s'il a expiré (401), la session est renouvelée
+// une fois par le cookie de rafraîchissement avant de rejouer la requête.
+async function authorizedFetch(
+  accessToken: string | null | undefined,
+  url: string,
+  init: RequestInit = {}
+): Promise<Response> {
+  const send = (token: string | null | undefined) =>
+    fetch(url, {
+      ...init,
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...authHeaders(token ?? undefined),
+      },
+    });
+  const response = await send(getSubscriberToken() ?? accessToken);
+  if (response.status !== 401) return response;
+  try {
+    pendingRefresh ??= refreshSubscriberSession().finally(() => {
+      pendingRefresh = null;
+    });
+    const session = await pendingRefresh;
+    return await send(session.accessToken);
+  } catch {
+    return response;
+  }
 }
 
 export async function logoutSubscriber(): Promise<void> {
@@ -240,11 +279,10 @@ export async function requestRelayCommand(
   accessToken: string,
   desiredState: "ON" | "OFF"
 ) {
-  const response = await fetch("/api/relay/commands/", {
+  const response = await authorizedFetch(accessToken, "/api/relay/commands/", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...authHeaders(accessToken),
     },
     body: JSON.stringify({ desired_state: desiredState }),
   });
@@ -280,9 +318,11 @@ export function useDjangoDashboard(
     }
     const load = async () => {
       try {
-        const response = await fetch("/api/dashboard/", {
-          headers: authHeaders(accessToken),
-        });
+        const response = await authorizedFetch(
+          accessToken,
+          "/api/dashboard/",
+          {}
+        );
         const next = await parseJson<DjangoSnapshot>(response);
         if (!active) return;
         setData(next);
@@ -368,11 +408,10 @@ export async function askDjangoAssistant(
   question: string,
   accessToken?: string | null
 ) {
-  const response = await fetch("/api/assistant/", {
+  const response = await authorizedFetch(accessToken, "/api/assistant/", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...authHeaders(accessToken ?? undefined),
     },
     body: JSON.stringify({ question }),
   });
@@ -388,14 +427,17 @@ export async function initiatePayment(
   const body: Record<string, unknown> = { provider, amount_cdf: amountCdf };
   if (opts?.phoneNumber) body.phone_number = opts.phoneNumber;
   if (opts?.network) body.network = opts.network;
-  const response = await fetch("/api/payments/initiate/", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders(accessToken),
-    },
-    body: JSON.stringify(body),
-  });
+  const response = await authorizedFetch(
+    accessToken,
+    "/api/payments/initiate/",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }
+  );
   return parseJson<{
     provider: string;
     deposit_id?: string;
@@ -409,9 +451,10 @@ export async function initiatePayment(
 }
 
 export async function getPawaPayStatus(accessToken: string, depositId: string) {
-  const response = await fetch(
+  const response = await authorizedFetch(
+    accessToken,
     `/api/payments/pawapay/status/${encodeURIComponent(depositId)}/`,
-    { headers: authHeaders(accessToken) }
+    {}
   );
   return parseJson<{
     deposit_id: string;
@@ -428,14 +471,17 @@ export async function getPawaPayStatus(accessToken: string, depositId: string) {
 }
 
 export async function applyManualToken(accessToken: string, token: string) {
-  const response = await fetch("/api/recharges/manual/apply/", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders(accessToken),
-    },
-    body: JSON.stringify({ token }),
-  });
+  const response = await authorizedFetch(
+    accessToken,
+    "/api/recharges/manual/apply/",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ token }),
+    }
+  );
   return parseJson<{
     applied: boolean;
     recharge_id: string;
@@ -448,9 +494,7 @@ export async function applyManualToken(accessToken: string, token: string) {
 }
 
 export async function getBudget(accessToken: string) {
-  const response = await fetch("/api/budget/", {
-    headers: authHeaders(accessToken),
-  });
+  const response = await authorizedFetch(accessToken, "/api/budget/", {});
   return parseJson<{
     limit_kwh: number;
     warning_percentage: number;
@@ -459,11 +503,10 @@ export async function getBudget(accessToken: string) {
 }
 
 export async function updateBudget(accessToken: string, limitKwh: number) {
-  const response = await fetch("/api/budget/", {
+  const response = await authorizedFetch(accessToken, "/api/budget/", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...authHeaders(accessToken),
     },
     body: JSON.stringify({ limit_kwh: limitKwh }),
   });
@@ -478,9 +521,10 @@ export async function downloadReceiptPdf(
   accessToken: string,
   rechargeId: string
 ) {
-  const response = await fetch(
+  const response = await authorizedFetch(
+    accessToken,
     `/api/receipts/${encodeURIComponent(rechargeId)}/`,
-    { headers: authHeaders(accessToken) }
+    {}
   );
   if (!response.ok)
     throw new Error(
@@ -488,4 +532,130 @@ export async function downloadReceiptPdf(
         "Téléchargement du reçu impossible."
     );
   return await response.blob();
+}
+
+export type SubscriberProfile = {
+  first_name: string;
+  last_name: string;
+  meter_id: string;
+  email: string;
+  phone: string;
+  address: string;
+  channels: Record<NotificationChannel, ChannelState>;
+};
+
+export async function getProfile(accessToken: string) {
+  const response = await authorizedFetch(accessToken, "/api/profile/");
+  return parseJson<SubscriberProfile>(response);
+}
+
+export async function updateProfile(
+  accessToken: string,
+  contact: { email?: string; phone?: string; address?: string }
+) {
+  const response = await authorizedFetch(accessToken, "/api/profile/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(contact),
+  });
+  const content = (await response
+    .json()
+    .catch(() => ({}))) as SubscriberProfile & {
+    detail?: string;
+    email?: string | string[];
+    phone?: string | string[];
+  };
+  if (!response.ok) {
+    // Erreurs de validation DRF : { champ: ["message"] }
+    const fieldError = [content.phone, content.email].find(Array.isArray) as
+      | string[]
+      | undefined;
+    throw new Error(
+      fieldError?.[0] ||
+        content.detail ||
+        "Coordonnées refusées par le serveur."
+    );
+  }
+  return content as SubscriberProfile;
+}
+
+export async function sendTestNotification(accessToken: string) {
+  const response = await authorizedFetch(
+    accessToken,
+    "/api/notifications/test/",
+    { method: "POST", headers: { "Content-Type": "application/json" } }
+  );
+  return parseJson<{ results: Record<NotificationChannel, string> }>(response);
+}
+
+export async function acknowledgeAlert(accessToken: string, alertId: number) {
+  const response = await authorizedFetch(
+    accessToken,
+    `/api/alerts/${alertId}/ack/`,
+    { method: "POST", headers: { "Content-Type": "application/json" } }
+  );
+  return parseJson<{ acknowledged: boolean; open_alerts: number }>(response);
+}
+
+// --- Espace administrateur (compte Django is_staff) ---
+
+const ADMIN_TOKEN_KEY = "virunga-admin-token";
+
+export type AdminOverview = {
+  totalMeters: number;
+  onlineMeters: number;
+  lowBalanceMeters: number;
+  openAlerts: number;
+  sectors: Array<{
+    name: string;
+    territory: string;
+    online: number;
+    offline: number;
+    total: number;
+  }>;
+};
+
+export function getAdminToken() {
+  return sessionStorage.getItem(ADMIN_TOKEN_KEY);
+}
+
+export function clearAdminSession() {
+  sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+}
+
+export async function loginAdmin(username: string, password: string) {
+  const response = await fetch("/api/auth/admin/login/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  const data = await parseJson<{
+    access_token: string;
+    admin: { username: string };
+  }>(response);
+  sessionStorage.setItem(ADMIN_TOKEN_KEY, data.access_token);
+  return data;
+}
+
+export async function getAdminOverview(accessToken: string) {
+  const response = await fetch("/api/admin/overview/", {
+    headers: authHeaders(accessToken),
+  });
+  return parseJson<AdminOverview>(response);
+}
+
+export async function issueManualToken(
+  accessToken: string,
+  meterId: string,
+  energyKwh: number
+) {
+  const response = await fetch("/api/recharges/manual/issue/", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(accessToken),
+    },
+    body: JSON.stringify({ meter_id: meterId, energy_kwh: energyKwh }),
+  });
+  return parseJson<{ token: string; message: string }>(response);
 }

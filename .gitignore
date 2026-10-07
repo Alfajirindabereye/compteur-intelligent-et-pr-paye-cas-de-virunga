@@ -2,6 +2,13 @@
 **/node_modules
 .pnpm-store/
 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/staticfiles/
+
 # Build outputs
 dist/
 build/
@@ -29,6 +36,7 @@ build/
 .Trashes
 ehthumbs.db
 Thumbs.db
+*.lnk
 
 # Logs
 logs

@@ -12,19 +12,27 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import {
+  acknowledgeAlert,
   applyManualToken,
   askDjangoAssistant,
   clearSubscriberSession,
   downloadReceiptPdf,
   getBudget,
   getPawaPayStatus,
+  getProfile,
   initiatePayment,
   loginSubscriber,
+  logoutSubscriber,
+  refreshSubscriberSession,
   requestRelayCommand,
+  sendTestNotification,
   updateBudget,
+  updateProfile,
   useDjangoDashboard,
   useLocalNews,
+  type ChannelState,
   type DjangoSnapshot,
+  type NotificationChannel,
 } from "@/lib/djangoEnergy";
 import { isValidMeterCode, normalizeMeterCode } from "@/lib/meterValidation";
 import {
@@ -53,7 +61,9 @@ import {
   Leaf,
   LockKeyhole,
   LogOut,
+  Mail,
   Menu,
+  MessageCircle,
   Paintbrush,
   Power,
   RefreshCw,
@@ -185,6 +195,17 @@ function PublicView({ login }: { login: () => void }) {
   const current = slides[index];
   const move = (direction: number) =>
     setIndex(value => (value + direction + slides.length) % slides.length);
+  // Défilement automatique, suspendu au survol pour laisser le temps de lire.
+  const [paused, setPaused] = useState(false);
+  const slideCount = slides.length;
+  useEffect(() => {
+    if (paused) return;
+    const timer = window.setInterval(
+      () => setIndex(value => (value + 1) % slideCount),
+      6000
+    );
+    return () => window.clearInterval(timer);
+  }, [paused, slideCount]);
   const promos = [
     [
       "/img/centrale-matebe.jpg",
@@ -359,23 +380,49 @@ function PublicView({ login }: { login: () => void }) {
               </div>
             </div>
           </div>
-          <div className="relative min-h-[360px] overflow-hidden rounded-2xl bg-zinc-900 shadow-2xl sm:min-h-[470px]">
-            <img
-              src={current[0]}
-              alt={current[2]}
-              className="absolute inset-0 h-full w-full object-cover"
-            />
+          <div
+            className="relative min-h-[360px] overflow-hidden rounded-2xl bg-zinc-900 shadow-2xl sm:min-h-[470px]"
+            aria-roledescription="carrousel"
+            onMouseEnter={() => setPaused(true)}
+            onMouseLeave={() => setPaused(false)}
+          >
+            {slides.map((slide, position) => (
+              <img
+                key={slide[0]}
+                src={slide[0]}
+                alt={position === index ? slide[2] : ""}
+                aria-hidden={position !== index}
+                className={`absolute inset-0 h-full w-full object-cover transition-all duration-[1200ms] ease-out ${position === index ? "scale-100 opacity-100" : "scale-110 opacity-0"}`}
+              />
+            ))}
             <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/15 to-transparent" />
-            <span className="absolute left-5 top-5 border border-white/30 bg-black/20 px-3 py-1 text-[10px] font-bold tracking-[.14em] text-white backdrop-blur sm:left-6 sm:top-6">
+            <span
+              key={`tag-${index}`}
+              className="carousel-caption absolute left-5 top-5 border border-white/30 bg-black/20 px-3 py-1 text-[10px] font-bold tracking-[.14em] text-white backdrop-blur sm:left-6 sm:top-6"
+            >
               {current[1]}
             </span>
-            <div className="absolute bottom-0 p-6 text-white sm:p-8">
+            <div
+              key={`caption-${index}`}
+              className="carousel-caption absolute bottom-0 p-6 pb-12 text-white sm:p-8 sm:pb-12"
+            >
               <h2 className="max-w-lg text-2xl font-black tracking-[-.03em] sm:text-3xl">
                 {current[2]}
               </h2>
               <p className="mt-3 max-w-lg text-sm leading-6 text-white/75">
                 {current[3]}
               </p>
+            </div>
+            <div className="absolute bottom-5 left-6 flex items-center gap-2 sm:left-8">
+              {slides.map((slide, position) => (
+                <button
+                  key={slide[0]}
+                  aria-label={`Afficher le visuel ${position + 1}`}
+                  aria-current={position === index}
+                  onClick={() => setIndex(position)}
+                  className={`h-1.5 rounded-full transition-all duration-500 ${position === index ? "w-8 bg-white" : "w-3 bg-white/40 hover:bg-white/70"}`}
+                />
+              ))}
             </div>
             <div className="absolute right-4 top-1/2 flex -translate-y-1/2 flex-col gap-2 sm:right-5">
               <Button
@@ -606,54 +653,62 @@ function Login({
   };
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-md rounded-xl border-zinc-200 p-0">
-        <div className="bg-zinc-950 px-6 py-6 sm:px-7">
+      <DialogContent className="max-h-[92vh] w-[calc(100%-2rem)] gap-0 overflow-y-auto rounded-2xl border-zinc-200 p-0 shadow-2xl sm:max-w-[400px]">
+        <div className="bg-gradient-to-br from-zinc-950 to-emerald-950 px-5 py-4">
           <Brand dark />
         </div>
-        <div className="p-6 sm:p-7">
-          <DialogHeader>
-            <DialogTitle className="text-2xl font-black">
+        <div className="p-5">
+          <DialogHeader className="gap-1 text-left">
+            <DialogTitle className="text-xl font-black">
               Espace Abonné
             </DialogTitle>
-            <DialogDescription>
-              Saisissez votre identité et le code à 20 chiffres associé à votre
-              compteur intelligent.
+            <DialogDescription className="text-xs leading-5">
+              Votre identité et le code à 20 chiffres de votre compteur.
             </DialogDescription>
           </DialogHeader>
-          <div className="mt-7 space-y-5">
-            <div>
-              <Label htmlFor="nom">Nom</Label>
-              <Input
-                id="nom"
-                className="mt-2 h-11"
-                value={lastName}
-                onChange={event => setLastName(event.target.value)}
-                placeholder="Ex. Kambale"
-              />
-              {attempted && lastName.trim().length < 2 && (
-                <p className="mt-1 text-xs text-red-600">Le nom est requis.</p>
-              )}
-            </div>
-            <div>
-              <Label htmlFor="prenom">Prénom</Label>
-              <Input
-                id="prenom"
-                className="mt-2 h-11"
-                value={firstName}
-                onChange={event => setFirstName(event.target.value)}
-                placeholder="Ex. Amani"
-              />
-              {attempted && firstName.trim().length < 2 && (
-                <p className="mt-1 text-xs text-red-600">
-                  Le prénom est requis.
-                </p>
-              )}
+          <div
+            className="mt-4 space-y-3"
+            onKeyDown={event => {
+              if (event.key === "Enter") void send();
+            }}
+          >
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="nom">Nom</Label>
+                <Input
+                  id="nom"
+                  className="mt-1.5 h-10"
+                  value={lastName}
+                  onChange={event => setLastName(event.target.value)}
+                  placeholder="Ex. Kambale"
+                />
+                {attempted && lastName.trim().length < 2 && (
+                  <p className="mt-1 text-xs text-red-600">
+                    Le nom est requis.
+                  </p>
+                )}
+              </div>
+              <div>
+                <Label htmlFor="prenom">Prénom</Label>
+                <Input
+                  id="prenom"
+                  className="mt-1.5 h-10"
+                  value={firstName}
+                  onChange={event => setFirstName(event.target.value)}
+                  placeholder="Ex. Amani"
+                />
+                {attempted && firstName.trim().length < 2 && (
+                  <p className="mt-1 text-xs text-red-600">
+                    Le prénom est requis.
+                  </p>
+                )}
+              </div>
             </div>
             <div>
               <Label htmlFor="compteur">Code du compteur</Label>
               <Input
                 id="compteur"
-                className={`mt-2 h-11 font-mono tracking-[.08em] ${attempted && !isValidMeterCode(meterCode) ? "border-red-500" : ""}`}
+                className={`mt-1.5 h-10 font-mono tracking-[.08em] ${attempted && !isValidMeterCode(meterCode) ? "border-red-500" : ""}`}
                 inputMode="numeric"
                 maxLength={20}
                 value={meterCode}
@@ -686,7 +741,7 @@ function Login({
               </p>
             )}
           </div>
-          <DialogFooter className="mt-8">
+          <DialogFooter className="mt-5">
             <Button
               disabled={submitting}
               onClick={send}
@@ -698,7 +753,7 @@ function Login({
                 : "Accéder à mon espace sécurisé"}
             </Button>
           </DialogFooter>
-          <p className="mt-4 text-center text-[11px] text-zinc-500">
+          <p className="mt-3 text-center text-[11px] text-zinc-500">
             <ShieldCheck className="mr-1 inline h-3.5 w-3.5" /> L’identité est
             validée côté serveur avant l’accès au dashboard.
           </p>
@@ -928,7 +983,12 @@ function ConsumptionBreakdown({
     </section>
   );
 }
-type ConsumptionPoint = { label: string; kwh: number; recharge?: string };
+type ConsumptionPoint = {
+  label: string;
+  kwh: number;
+  recharge?: string;
+  date?: string;
+};
 function niceCeil(value: number): number {
   if (value <= 0) return 1;
   const p = Math.pow(10, Math.floor(Math.log10(value)));
@@ -974,7 +1034,65 @@ function Sparkline({
     </svg>
   );
 }
+// Courbe lissée à tangentes horizontales : pas de dépassement entre deux points.
+function smoothPath(points: [number, number][]): string {
+  if (points.length === 0) return "";
+  let d = `M ${points[0][0].toFixed(1)} ${points[0][1].toFixed(1)}`;
+  for (let i = 1; i < points.length; i++) {
+    const [px, py] = points[i - 1];
+    const [cx, cy] = points[i];
+    const mx = ((px + cx) / 2).toFixed(1);
+    d += ` C ${mx} ${py.toFixed(1)}, ${mx} ${cy.toFixed(1)}, ${cx.toFixed(1)} ${cy.toFixed(1)}`;
+  }
+  return d;
+}
+// Infobulle SVG partagée par les graphiques (fond sombre, deux lignes).
+function ChartTooltip({
+  x,
+  y,
+  title,
+  value,
+  bounds,
+}: {
+  x: number;
+  y: number;
+  title: string;
+  value: string;
+  bounds: [number, number];
+}) {
+  const width = Math.max(title.length * 5.6, value.length * 6.6) + 20;
+  const left = Math.min(Math.max(x - width / 2, bounds[0]), bounds[1] - width);
+  const top = Math.max(y - 46, 2);
+  return (
+    <g pointerEvents="none">
+      <rect
+        x={left}
+        y={top}
+        width={width}
+        height="36"
+        rx="8"
+        fill="#0f172a"
+        opacity="0.94"
+      />
+      <text
+        x={left + 10}
+        y={top + 14}
+        className="fill-slate-300 text-[9px] font-mono"
+      >
+        {title}
+      </text>
+      <text
+        x={left + 10}
+        y={top + 28}
+        className="fill-white text-[11px] font-mono font-semibold"
+      >
+        {value}
+      </text>
+    </g>
+  );
+}
 function LiveChart({ series }: { series: ConsumptionPoint[] }) {
+  const [hover, setHover] = useState<number | null>(null);
   const w = 720,
     h = 250,
     padL = 42,
@@ -983,17 +1101,20 @@ function LiveChart({ series }: { series: ConsumptionPoint[] }) {
     padB = 30;
   const iw = w - padL - padR,
     ih = h - padT - padB;
+  if (series.length === 0)
+    return (
+      <p className="flex h-[200px] items-center justify-center rounded-xl bg-slate-50 text-xs text-slate-500">
+        Aucune télémétrie reçue sur les dernières 24 h.
+      </p>
+    );
   const values = series.map(point => point.kwh);
   const max = niceCeil(Math.max(...values, 0.001));
   const n = Math.max(series.length, 2);
   const x = (index: number) => padL + (index / (n - 1)) * iw;
   const y = (value: number) => padT + ih - (value / max) * ih;
-  const line = series
-    .map(
-      (point, index) =>
-        `${index === 0 ? "M" : "L"} ${x(index).toFixed(1)} ${y(point.kwh).toFixed(1)}`
-    )
-    .join(" ");
+  const line = smoothPath(
+    series.map((point, index) => [x(index), y(point.kwh)])
+  );
   const baseline = (padT + ih).toFixed(1);
   const area = `${line} L ${x(series.length - 1).toFixed(1)} ${baseline} L ${padL} ${baseline} Z`;
   const gridLines = [0, 0.25, 0.5, 0.75, 1].map(fraction => ({
@@ -1001,18 +1122,47 @@ function LiveChart({ series }: { series: ConsumptionPoint[] }) {
     label: format(max * fraction, 1),
   }));
   const xStep = Math.max(1, Math.ceil(series.length / 7));
+  const locate = (clientX: number, target: SVGSVGElement) => {
+    const rect = target.getBoundingClientRect();
+    if (!rect.width) return;
+    const px = ((clientX - rect.left) / rect.width) * w;
+    const index = Math.round(((px - padL) / iw) * (n - 1));
+    setHover(Math.min(series.length - 1, Math.max(0, index)));
+  };
+  const active = hover !== null ? series[hover] : null;
   return (
     <svg
       viewBox={`0 0 ${w} ${h}`}
-      className="w-full"
+      className="w-full touch-pan-y"
       role="img"
       aria-label="Consommation en temps réel"
+      onMouseMove={event => locate(event.clientX, event.currentTarget)}
+      onMouseLeave={() => setHover(null)}
+      onTouchStart={event =>
+        locate(event.touches[0].clientX, event.currentTarget)
+      }
+      onTouchMove={event =>
+        locate(event.touches[0].clientX, event.currentTarget)
+      }
     >
       <defs>
         <linearGradient id="liveFill" x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%" stopColor="#10b981" stopOpacity="0.28" />
-          <stop offset="100%" stopColor="#10b981" stopOpacity="0.02" />
+          <stop offset="0%" stopColor="#10b981" stopOpacity="0.38" />
+          <stop offset="60%" stopColor="#14b8a6" stopOpacity="0.1" />
+          <stop offset="100%" stopColor="#14b8a6" stopOpacity="0" />
         </linearGradient>
+        <linearGradient id="liveStroke" x1="0" x2="1" y1="0" y2="0">
+          <stop offset="0%" stopColor="#0ea5e9" />
+          <stop offset="55%" stopColor="#10b981" />
+          <stop offset="100%" stopColor="#84cc16" />
+        </linearGradient>
+        <filter id="liveGlow" x="-10%" y="-40%" width="120%" height="180%">
+          <feGaussianBlur stdDeviation="4" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
       </defs>
       {gridLines.map(({ py, label }) => (
         <g key={`${label}-${py}`}>
@@ -1023,6 +1173,7 @@ function LiveChart({ series }: { series: ConsumptionPoint[] }) {
             y2={py}
             stroke="#e2e8f0"
             strokeWidth="1"
+            strokeDasharray="3 5"
           />
           <text
             x={padL - 6}
@@ -1051,51 +1202,113 @@ function LiveChart({ series }: { series: ConsumptionPoint[] }) {
       <path d={area} fill="url(#liveFill)" />
       <path
         d={line}
+        pathLength="1"
+        className="chart-draw"
         fill="none"
-        stroke="#10b981"
-        strokeWidth="2.2"
+        stroke="url(#liveStroke)"
+        strokeWidth="2.6"
         strokeLinejoin="round"
         strokeLinecap="round"
+        filter="url(#liveGlow)"
       />
       {series.map(
         (point, index) =>
           point.recharge && (
-            <circle
-              key={`recharge-${index}`}
-              cx={x(index)}
-              cy={y(point.kwh)}
-              r="4"
-              fill="#f59e0b"
-              stroke="#ffffff"
-              strokeWidth="1.5"
-            />
+            <g key={`recharge-${index}`}>
+              <circle
+                cx={x(index)}
+                cy={y(point.kwh)}
+                r="8"
+                fill="#f59e0b"
+                opacity="0.22"
+              />
+              <circle
+                cx={x(index)}
+                cy={y(point.kwh)}
+                r="4"
+                fill="#f59e0b"
+                stroke="#ffffff"
+                strokeWidth="1.5"
+              />
+            </g>
           )
+      )}
+      {active && hover !== null && (
+        <>
+          <line
+            x1={x(hover)}
+            x2={x(hover)}
+            y1={padT}
+            y2={padT + ih}
+            stroke="#10b981"
+            strokeWidth="1"
+            strokeDasharray="4 4"
+            opacity="0.7"
+          />
+          <circle
+            cx={x(hover)}
+            cy={y(active.kwh)}
+            r="5"
+            fill="#ffffff"
+            stroke="#10b981"
+            strokeWidth="2.5"
+          />
+          <ChartTooltip
+            x={x(hover)}
+            y={y(active.kwh)}
+            title={
+              active.recharge
+                ? `${active.label} · recharge ${active.recharge === "SAISIE_MANUELLE" ? "revendeur" : "en ligne"}`
+                : active.label
+            }
+            value={`${format(active.kwh, 3)} kWh`}
+            bounds={[padL, w - padR]}
+          />
+        </>
       )}
     </svg>
   );
 }
 function WeeklyBars({ series }: { series: ConsumptionPoint[] }) {
+  const [hover, setHover] = useState<number | null>(null);
   const w = 460,
     h = 190,
     padL = 10,
     padR = 8,
-    padT = 14,
+    padT = 22,
     padB = 26;
   const iw = w - padL - padR,
     ih = h - padT - padB;
+  if (series.length === 0)
+    return (
+      <p className="flex h-[150px] items-center justify-center rounded-xl bg-slate-50 text-xs text-slate-500">
+        Aucun relevé sur les 7 derniers jours.
+      </p>
+    );
   const max = niceCeil(Math.max(...series.map(point => point.kwh), 0.001));
   const slot = iw / Math.max(series.length, 1);
-  const barWidth = Math.max(14, slot - 10);
+  const barWidth = Math.max(14, slot - 14);
+  const active = hover !== null ? series[hover] : null;
   return (
     <svg
       viewBox={`0 0 ${w} ${h}`}
       className="w-full"
       role="img"
       aria-label="Historique des 7 derniers jours"
+      onMouseLeave={() => setHover(null)}
     >
+      <defs>
+        <linearGradient id="weekBar" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor="#34d399" />
+          <stop offset="100%" stopColor="#0d9488" />
+        </linearGradient>
+        <linearGradient id="weekBarToday" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor="#a3e635" />
+          <stop offset="100%" stopColor="#10b981" />
+        </linearGradient>
+      </defs>
       {[0.25, 0.5, 0.75, 1].map(fraction => {
         const py = padT + ih - fraction * ih;
-        const value = max * fraction;
         return (
           <g key={fraction}>
             <line
@@ -1105,50 +1318,72 @@ function WeeklyBars({ series }: { series: ConsumptionPoint[] }) {
               y2={py}
               stroke="#e2e8f0"
               strokeWidth="1"
+              strokeDasharray="3 5"
             />
             <text
               x={padL + 2}
               y={py - 3}
               className="fill-slate-400 text-[9px] font-mono"
             >
-              {format(value, 1)}
+              {format(max * fraction, 1)}
             </text>
           </g>
         );
       })}
       {series.map((point, index) => {
         const cx = padL + index * slot + slot / 2;
-        const barH = (point.kwh / max) * ih;
+        const barH = Math.max((point.kwh / max) * ih, 2);
         const py = padT + ih - barH;
+        const today = index === series.length - 1;
+        const dimmed = hover !== null && hover !== index;
         return (
-          <g key={`${point.label}-${index}`}>
+          <g
+            key={`${point.label}-${index}`}
+            onMouseEnter={() => setHover(index)}
+            onTouchStart={() => setHover(index)}
+          >
             <rect
+              x={cx - slot / 2}
+              y={padT}
+              width={slot}
+              height={ih}
+              fill="transparent"
+            />
+            <rect
+              className="chart-bar"
+              style={{ animationDelay: `${index * 60}ms` }}
               x={cx - barWidth / 2}
               y={py}
               width={barWidth}
-              height={Math.max(barH, 2)}
-              rx="4"
-              fill="#10b981"
+              height={barH}
+              rx="6"
+              fill={today ? "url(#weekBarToday)" : "url(#weekBar)"}
+              opacity={dimmed ? 0.45 : 1}
             />
-            <text
-              x={cx}
-              y={py - 5}
-              textAnchor="middle"
-              className="fill-slate-600 text-[9px] font-mono"
-            >
-              {format(point.kwh, 1)}
-            </text>
             <text
               x={cx}
               y={padT + ih + 16}
               textAnchor="middle"
-              className="fill-slate-400 text-[9px] font-mono"
+              className={`text-[9px] font-mono ${today ? "fill-emerald-600 font-bold" : "fill-slate-400"}`}
             >
               {point.label.slice(0, 3)}
             </text>
           </g>
         );
       })}
+      {active && hover !== null && (
+        <ChartTooltip
+          x={padL + hover * slot + slot / 2}
+          y={padT + ih - Math.max((active.kwh / max) * ih, 2)}
+          title={
+            active.date
+              ? `${active.label} ${new Date(`${active.date}T12:00:00`).toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" })}`
+              : active.label
+          }
+          value={`${format(active.kwh, 2)} kWh`}
+          bounds={[padL, w - padR]}
+        />
+      )}
     </svg>
   );
 }
@@ -1168,27 +1403,49 @@ function Gauge({
   const clamp = Math.min(1, Math.max(0.02, ratio));
   const length = Math.PI * r;
   const path = `M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`;
+  // La couleur suit le niveau : rouge quand le crédit s'épuise, vert quand il est confortable.
+  const [from, to] =
+    ratio <= 0.15
+      ? ["#ef4444", "#f97316"]
+      : ratio <= 0.4
+        ? ["#f59e0b", "#facc15"]
+        : ["#10b981", "#a3e635"];
   return (
     <svg
-      viewBox={`0 0 ${size} ${size * 0.62}`}
+      viewBox={`0 0 ${size} ${size * 0.7}`}
       className="mx-auto w-[190px]"
       role="img"
       aria-label="Prévision et solde"
     >
+      <defs>
+        <linearGradient id="gaugeStroke" x1="0" x2="1" y1="0" y2="0">
+          <stop offset="0%" stopColor={from} />
+          <stop offset="100%" stopColor={to} />
+        </linearGradient>
+        <filter id="gaugeGlow" x="-20%" y="-20%" width="140%" height="160%">
+          <feGaussianBlur stdDeviation="3.5" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
       <path
         d={path}
         fill="none"
         stroke="#e2e8f0"
-        strokeWidth="16"
+        strokeWidth="14"
         strokeLinecap="round"
       />
       <path
         d={path}
         fill="none"
-        stroke="#34d399"
-        strokeWidth="16"
+        stroke="url(#gaugeStroke)"
+        strokeWidth="14"
         strokeLinecap="round"
         strokeDasharray={`${clamp * length} ${length}`}
+        filter="url(#gaugeGlow)"
+        style={{ transition: "stroke-dasharray 800ms ease" }}
       />
       <text
         x={cx}
@@ -1209,6 +1466,259 @@ function Gauge({
     </svg>
   );
 }
+// Niveau du crédit prépayé par rapport au dernier plein, avec les seuils d'alerte dégressifs.
+function CreditLevel({ credit }: { credit: DjangoSnapshot["credit"] }) {
+  if (!credit || credit.percent === null) return null;
+  const percent = Math.max(0, Math.min(100, credit.percent));
+  const critical = percent <= 5;
+  const warning = !critical && percent <= 15;
+  const tone = critical
+    ? "border-red-200 bg-red-50 text-red-700"
+    : warning
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : "border-emerald-200 bg-emerald-50 text-emerald-700";
+  const bar = critical
+    ? "from-red-500 to-orange-400"
+    : warning
+      ? "from-amber-500 to-yellow-400"
+      : "from-emerald-500 to-lime-400";
+  return (
+    <div
+      className={`rounded-xl border p-3 ${tone}`}
+      role="status"
+      aria-label="Niveau de crédit"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <p className="flex items-center gap-2 text-xs font-semibold">
+          <span className="relative flex h-2.5 w-2.5">
+            {(critical || warning) && (
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-current opacity-60" />
+            )}
+            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-current" />
+          </span>
+          Niveau de crédit
+        </p>
+        <p className="font-mono text-lg font-bold">{format(percent, 1)} %</p>
+      </div>
+      <div className="mt-2 h-2.5 w-full overflow-hidden rounded-full bg-white/70">
+        <div
+          className={`h-full rounded-full bg-gradient-to-r transition-all duration-700 ${bar}`}
+          style={{ width: `${Math.max(percent, 1.5)}%` }}
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {credit.thresholds.map(threshold => {
+          const reached = percent <= threshold;
+          return (
+            <span
+              key={threshold}
+              className={`rounded-full border px-2 py-0.5 font-mono text-[10px] font-bold ${reached ? "border-current bg-current/10" : "border-slate-200 bg-white/60 text-slate-400"}`}
+            >
+              {threshold} %{reached ? " ✓" : ""}
+            </span>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-[11px] leading-4 opacity-90">
+        {credit.threshold !== null
+          ? `Seuil ${credit.threshold} % franchi : alerte émise. Dernier plein : ${format(credit.reference_kwh, 2)} kWh.`
+          : `Alertes prévues à ${credit.thresholds.join(", ")} % du dernier plein (${format(credit.reference_kwh, 2)} kWh).`}
+      </p>
+    </div>
+  );
+}
+const CHANNEL_LABELS: Record<NotificationChannel, string> = {
+  email: "E-mail",
+  sms: "SMS",
+  whatsapp: "WhatsApp",
+};
+const CHANNEL_STATE: Record<ChannelState, { text: string; tone: string }> = {
+  ready: { text: "Prêt", tone: "bg-emerald-100 text-emerald-700" },
+  no_contact: {
+    text: "Coordonnée manquante",
+    tone: "bg-amber-100 text-amber-700",
+  },
+  not_configured: {
+    text: "Non configuré côté serveur",
+    tone: "bg-slate-100 text-slate-500",
+  },
+};
+function describeDelivery(result: string): string {
+  if (result === "sent") return "envoyé";
+  if (result === "no_contact") return "coordonnée manquante";
+  if (result === "not_configured") return "non configuré côté serveur";
+  return result.replace(/^error: /, "échec — ");
+}
+// Coordonnées de l'abonné et canaux par lesquels partent les alertes de crédit.
+function NotificationsPanel({
+  token,
+  channels,
+  onDone,
+}: {
+  token?: string | null;
+  channels?: DjangoSnapshot["notifications"];
+  onDone?: () => void;
+}) {
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [busy, setBusy] = useState<"save" | "test" | null>(null);
+  const [message, setMessage] = useState<{
+    kind: "ok" | "error";
+    text: string;
+  } | null>(null);
+  const [states, setStates] = useState(channels);
+  useEffect(() => setStates(channels), [channels]);
+  useEffect(() => {
+    if (!token) return;
+    let active = true;
+    getProfile(token)
+      .then(profile => {
+        if (!active) return;
+        setEmail(profile.email ?? "");
+        setPhone(profile.phone ?? "");
+        setStates(profile.channels);
+      })
+      .catch(() => {
+        // Le formulaire reste utilisable : l'enregistrement signalera l'erreur.
+      });
+    return () => {
+      active = false;
+    };
+  }, [token]);
+  const save = async () => {
+    if (!token) return;
+    setBusy("save");
+    setMessage(null);
+    try {
+      const profile = await updateProfile(token, {
+        email: email.trim(),
+        phone: phone.trim(),
+      });
+      setStates(profile.channels);
+      setMessage({ kind: "ok", text: "Coordonnées enregistrées." });
+      onDone?.();
+    } catch (cause) {
+      setMessage({
+        kind: "error",
+        text:
+          cause instanceof Error ? cause.message : "Enregistrement impossible.",
+      });
+    } finally {
+      setBusy(null);
+    }
+  };
+  const test = async () => {
+    if (!token) return;
+    setBusy("test");
+    setMessage(null);
+    try {
+      const { results } = await sendTestNotification(token);
+      const summary = (Object.keys(CHANNEL_LABELS) as NotificationChannel[])
+        .map(
+          channel =>
+            `${CHANNEL_LABELS[channel]} : ${describeDelivery(results[channel] ?? "not_configured")}`
+        )
+        .join(" · ");
+      const sent = Object.values(results).some(result => result === "sent");
+      setMessage({ kind: sent ? "ok" : "error", text: summary });
+    } catch (cause) {
+      setMessage({
+        kind: "error",
+        text: cause instanceof Error ? cause.message : "Essai impossible.",
+      });
+    } finally {
+      setBusy(null);
+    }
+  };
+  const icons = { email: Mail, sms: Smartphone, whatsapp: MessageCircle };
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h2 className="flex items-center gap-2 text-lg font-semibold">
+        <BellRing className="h-5 w-5 text-emerald-600" /> Alertes de crédit
+      </h2>
+      <p className="mt-1 text-xs text-slate-500">
+        Vous êtes prévenu quand votre crédit descend à 15 %, puis à 10 %, 5 %, 3
+        % et 1 % du dernier plein.
+      </p>
+      <div className="mt-3 grid gap-2 sm:grid-cols-3">
+        {(Object.keys(CHANNEL_LABELS) as NotificationChannel[]).map(channel => {
+          const Icon = icons[channel];
+          const state = CHANNEL_STATE[states?.[channel] ?? "not_configured"];
+          return (
+            <div
+              key={channel}
+              className="rounded-xl border border-slate-100 p-3"
+            >
+              <p className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+                <Icon className="h-3.5 w-3.5 text-emerald-600" />
+                {CHANNEL_LABELS[channel]}
+              </p>
+              <span
+                className={`mt-2 inline-block rounded-full px-2 py-0.5 text-[10px] font-bold ${state.tone}`}
+              >
+                {state.text}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <div>
+          <Label htmlFor="contact-email" className="text-xs">
+            Adresse e-mail
+          </Label>
+          <Input
+            id="contact-email"
+            type="email"
+            value={email}
+            onChange={event => setEmail(event.target.value)}
+            placeholder="vous@gmail.com"
+            className="mt-1 h-10"
+          />
+        </div>
+        <div>
+          <Label htmlFor="contact-phone" className="text-xs">
+            Téléphone (SMS et WhatsApp)
+          </Label>
+          <Input
+            id="contact-phone"
+            inputMode="tel"
+            value={phone}
+            onChange={event => setPhone(event.target.value)}
+            placeholder="0993 456 789"
+            className="mt-1 h-10"
+          />
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button
+          type="button"
+          disabled={!token || busy !== null}
+          onClick={save}
+          className="h-10 bg-emerald-600 hover:bg-emerald-700"
+        >
+          {busy === "save" ? "Enregistrement…" : "Enregistrer"}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={!token || busy !== null}
+          onClick={test}
+          className="h-10 border-slate-200"
+        >
+          {busy === "test" ? "Envoi…" : "Envoyer un message d'essai"}
+        </Button>
+      </div>
+      {message && (
+        <p
+          className={`mt-3 rounded-lg border p-2 text-xs leading-5 ${message.kind === "ok" ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-red-200 bg-red-50 text-red-700"}`}
+        >
+          {message.text}
+        </p>
+      )}
+    </div>
+  );
+}
 const DASHBOARD_NAV = [
   { label: "Tableau de bord", icon: LayoutDashboard, active: true },
   { label: "Temps réel", icon: Activity, live: true },
@@ -1223,17 +1733,18 @@ const DASHBOARD_NAV = [
 ];
 const NAV_TARGET: Record<string, string> = {
   "Tableau de bord": "dashboard-main",
-  "Temps réel": "dashboard-main",
-  Consommation: "dashboard-main",
+  "Temps réel": "panel-live",
+  Consommation: "panel-consommation",
   Historique: "panel-transactions",
   Recharges: "panel-recharges",
   Factures: "panel-transactions",
   Alertes: "panel-alertes",
-  Appareils: "dashboard-main",
-  Rapports: "dashboard-main",
-  Paramètres: "panel-budget",
+  Appareils: "panel-compteur",
+  Rapports: "panel-rapport",
+  Paramètres: "panel-notifications",
 };
 const ALERT_STYLE: Record<string, string> = {
+  CRITICAL: "border-red-200 bg-red-50 text-red-700",
   CRITIQUE: "border-red-200 bg-red-50 text-red-700",
   WARNING: "border-amber-200 bg-amber-50 text-amber-700",
   INFO: "border-sky-200 bg-sky-50 text-sky-700",
@@ -1513,6 +2024,7 @@ function AssistantPanel({ token }: { token?: string | null }) {
           className="h-10 bg-emerald-600 hover:bg-emerald-700"
         >
           <Send className="h-4 w-4" />
+          <span className="sr-only">Envoyer la question</span>
         </Button>
       </form>
     </div>
@@ -1831,7 +2343,7 @@ function PaymentPanel({
           <Input
             value={tokenValue}
             onChange={e => setTokenValue(e.target.value)}
-            placeholder="Coller le token de 20 chiffres…"
+            placeholder="Coller le token du revendeur (VSE.…)"
             className="h-10 font-mono"
           />
           <Button
@@ -2064,6 +2576,10 @@ function Dashboard({
   >(null);
   const [search, setSearch] = useState("");
   const [showAlerts, setShowAlerts] = useState(false);
+  const [activeNav, setActiveNav] = useState("Tableau de bord");
+  const [showAllAlerts, setShowAllAlerts] = useState(false);
+  const [ackBusy, setAckBusy] = useState<number | null>(null);
+  const [alertError, setAlertError] = useState("");
   useEffect(() => {
     if (!data?.relay_command) setOptimisticCommand(null);
   }, [data?.relay_command]);
@@ -2101,13 +2617,34 @@ function Dashboard({
   );
   const daysLeft = data.estimate_hours / 24;
   const avgDaily = weekly / 7;
-  const balanceRatio = Math.min(
-    1,
-    (data.balance.kwh ?? 0) / Math.max(data.budget.limit_kwh ?? 1, 1)
-  );
+  // La jauge suit le niveau de crédit réel (part du dernier plein) quand l'API le fournit.
+  const balanceRatio =
+    typeof data.credit?.percent === "number"
+      ? Math.min(1, data.credit.percent / 100)
+      : Math.min(
+          1,
+          (data.balance.kwh ?? 0) / Math.max(data.budget.limit_kwh ?? 1, 1)
+        );
   const online = data.meter.device_status === "ONLINE";
   const signal = data.meter.signal_strength ?? 0;
   const powerKw = Number(t.power) / 1000;
+  // Tarif réel renvoyé par l'API ; à défaut, déduit du solde (même taux kWh → US$).
+  const usdPerKwh =
+    data.tariff?.usd_per_kwh ??
+    (data.balance.kwh > 0 ? data.balance.usd / data.balance.kwh : 0);
+  const lastSeen = (() => {
+    if (!data.last_telemetry_at) return "inconnue";
+    const seconds = Math.max(
+      0,
+      Math.round(
+        (Date.now() - new Date(data.last_telemetry_at).getTime()) / 1000
+      )
+    );
+    if (seconds < 60) return `il y a ${seconds} s`;
+    if (seconds < 3600) return `il y a ${Math.round(seconds / 60)} min`;
+    if (seconds < 86400) return `il y a ${Math.round(seconds / 3600)} h`;
+    return `le ${new Date(data.last_telemetry_at).toLocaleDateString("fr-FR")}`;
+  })();
   const submitRelay = async () => {
     setCommandError("");
     if (!subscriber.accessToken) {
@@ -2155,7 +2692,12 @@ function Dashboard({
       label: "Tension",
       value: format(t.voltage),
       unit: "V",
-      sub: "Stable",
+      sub:
+        t.voltage > 253
+          ? "Surtension"
+          : t.voltage > 0 && t.voltage < 207
+            ? "Sous-tension"
+            : "Dans la plage normale",
       icon: GaugeIcon,
       gradient: "from-orange-500 to-amber-400",
       spark: spark(data.consumption),
@@ -2171,7 +2713,7 @@ function Dashboard({
     },
     {
       label: "Coût estimé aujourd'hui",
-      value: format(data.balance.usd),
+      value: format(daily * usdPerKwh),
       unit: "$",
       sub: "Basé sur votre tarif",
       icon: CircleDollarSign,
@@ -2189,6 +2731,52 @@ function Dashboard({
     document
       .getElementById(id)
       ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  const acknowledge = async (alertId: number) => {
+    if (!subscriber.accessToken) return;
+    setAckBusy(alertId);
+    setAlertError("");
+    try {
+      await acknowledgeAlert(subscriber.accessToken, alertId);
+      refresh?.();
+    } catch (cause) {
+      setAlertError(
+        cause instanceof Error ? cause.message : "Acquittement impossible."
+      );
+    } finally {
+      setAckBusy(null);
+    }
+  };
+  // Rapport téléchargeable : les mêmes relevés que ceux affichés (7 jours et 24 h).
+  const downloadReport = () => {
+    const rows: string[][] = [
+      ["date", "jour", "consommation_kwh"],
+      ...(data.consumption_weekly ?? []).map(day => [
+        day.date ?? "",
+        day.label,
+        String(day.kwh),
+      ]),
+      [],
+      ["heure", "consommation_kwh", "recharge"],
+      ...(data.consumption ?? []).map(point => [
+        point.label,
+        String(point.kwh),
+        point.recharge ?? "",
+      ]),
+    ];
+    const csv = rows
+      .map(row => row.map(cell => `"${cell.replace(/"/g, '""')}"`).join(";"))
+      .join("\r\n");
+    const url = URL.createObjectURL(
+      new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })
+    );
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `rapport-consommation-${data.meter.id}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
   const searchResults = (() => {
     const q = search.trim().toLowerCase();
     if (!q)
@@ -2254,10 +2842,12 @@ function Dashboard({
             return (
               <button
                 key={item.label}
-                onClick={() =>
-                  scrollToPanel(NAV_TARGET[item.label] ?? "dashboard-main")
-                }
-                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium ${item.active ? "bg-emerald-600 text-white" : "text-slate-300 hover:bg-slate-800 hover:text-white"}`}
+                aria-current={activeNav === item.label ? "page" : undefined}
+                onClick={() => {
+                  setActiveNav(item.label);
+                  scrollToPanel(NAV_TARGET[item.label] ?? "dashboard-main");
+                }}
+                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${activeNav === item.label ? "bg-emerald-600 text-white" : "text-slate-300 hover:bg-slate-800 hover:text-white"}`}
               >
                 <Icon className="h-4 w-4" />
                 <span className="flex-1 text-left">{item.label}</span>
@@ -2482,11 +3072,14 @@ function Dashboard({
           {/* Dispatch row */}
           <div className="mt-4 grid gap-4 xl:grid-cols-3">
             {/* Live chart */}
-            <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm xl:col-span-2">
+            <div
+              id="panel-live"
+              className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm xl:col-span-2"
+            >
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <p className="text-[10px] font-bold uppercase tracking-[.18em] text-slate-400">
-                    Aujourd'hui · 5 min
+                    Dernières 24 h · par heure
                   </p>
                   <h2 className="mt-1 flex items-center gap-2 text-lg font-semibold">
                     Consommation en temps réel{" "}
@@ -2532,7 +3125,10 @@ function Dashboard({
             </div>
             {/* Right column: états + alertes */}
             <div className="space-y-4">
-              <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <div
+                id="panel-compteur"
+                className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
+              >
                 <div className="flex items-center justify-between">
                   <h2 className="text-lg font-semibold">État du compteur</h2>
                   <span
@@ -2558,8 +3154,8 @@ function Dashboard({
                       </span>
                     </p>
                     <p className="mt-0.5 flex items-center gap-1 text-xs text-slate-500">
-                      <Clock3 className="h-3 w-3" /> Dernière communication il y
-                      a 5 s
+                      <Clock3 className="h-3 w-3" /> Dernière communication{" "}
+                      {lastSeen}
                     </p>
                   </div>
                 </div>
@@ -2612,57 +3208,86 @@ function Dashboard({
               >
                 <div className="flex items-center justify-between">
                   <h2 className="text-lg font-semibold">Alertes récentes</h2>
-                  <span className="text-xs font-medium text-slate-400">
-                    Voir tout
-                  </span>
+                  {alerts.length > 3 && (
+                    <button
+                      onClick={() => setShowAllAlerts(value => !value)}
+                      className="text-xs font-medium text-emerald-700 hover:underline"
+                    >
+                      {showAllAlerts
+                        ? "Réduire"
+                        : `Voir tout (${alerts.length})`}
+                    </button>
+                  )}
                 </div>
-                <div className="mt-3 space-y-2">
+                <div className="mt-3">
+                  <CreditLevel credit={data.credit} />
+                </div>
+                <div className="mt-3 space-y-2" aria-live="polite">
                   {alerts.length === 0 && (
                     <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
                       Aucune alerte récente.
                     </p>
                   )}
-                  {alerts.map((alert, index) => (
-                    <div
-                      key={`${alert.kind}-${index}`}
-                      className={`flex items-start justify-between gap-2 rounded-lg border p-3 ${ALERT_STYLE[alert.severity] ?? ALERT_STYLE.INFO}`}
-                    >
-                      <div className="flex items-start gap-2">
-                        {alert.severity === "WARNING" ? (
-                          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                        ) : (
-                          <Info className="mt-0.5 h-4 w-4 shrink-0" />
-                        )}
-                        <div>
-                          <p className="text-xs font-semibold">
-                            {alert.kind.replace(/_/g, " ")}
-                          </p>
-                          <p className="mt-0.5 text-[11px] leading-4 opacity-90">
-                            {alert.message}
-                          </p>
+                  {(showAllAlerts ? alerts : alerts.slice(0, 3)).map(
+                    (alert, index) => (
+                      <div
+                        key={alert.id ?? `${alert.kind}-${index}`}
+                        className={`flex items-start justify-between gap-2 rounded-lg border p-3 ${ALERT_STYLE[alert.severity] ?? ALERT_STYLE.INFO}`}
+                      >
+                        <div className="flex items-start gap-2">
+                          {alert.severity === "INFO" ? (
+                            <Info className="mt-0.5 h-4 w-4 shrink-0" />
+                          ) : (
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                          )}
+                          <div>
+                            <p className="text-xs font-semibold">
+                              {alert.kind.replace(/_/g, " ")}
+                            </p>
+                            <p className="mt-0.5 text-[11px] leading-4 opacity-90">
+                              {alert.message}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 flex-col items-end gap-1">
+                          <span className="text-[10px] opacity-70">
+                            {alert.created_at
+                              ? new Date(alert.created_at).toLocaleTimeString(
+                                  "fr-FR",
+                                  { hour: "2-digit", minute: "2-digit" }
+                                )
+                              : ""}
+                          </span>
+                          {alert.id !== undefined && subscriber.accessToken && (
+                            <button
+                              disabled={ackBusy === alert.id}
+                              onClick={() => acknowledge(alert.id as number)}
+                              className="rounded-md border border-current/30 px-1.5 py-0.5 text-[10px] font-semibold hover:bg-white/60"
+                            >
+                              {ackBusy === alert.id ? "…" : "Marquer lue"}
+                            </button>
+                          )}
                         </div>
                       </div>
-                      <span className="shrink-0 text-[10px] opacity-70">
-                        {alert.created_at
-                          ? new Date(alert.created_at).toLocaleTimeString(
-                              "fr-FR",
-                              { hour: "2-digit", minute: "2-digit" }
-                            )
-                          : ""}
-                      </span>
-                    </div>
-                  ))}
+                    )
+                  )}
+                  {alertError && (
+                    <p className="text-xs text-red-600">{alertError}</p>
+                  )}
                 </div>
               </div>
             </div>
           </div>
           {/* Donuts + Historique + Prévision */}
           <div className="mt-4 grid gap-4 xl:grid-cols-3">
-            <div className="xl:col-span-2">
+            <div id="panel-consommation" className="xl:col-span-2">
               <ConsumptionBreakdown data={data} />
             </div>
             <div className="space-y-4">
-              <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <div
+                id="panel-rapport"
+                className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
+              >
                 <p className="text-[10px] font-bold uppercase tracking-[.18em] text-slate-400">
                   Historique
                 </p>
@@ -2670,8 +3295,12 @@ function Dashboard({
                 <div className="mt-4">
                   <WeeklyBars series={data.consumption_weekly ?? []} />
                 </div>
-                <button className="mt-2 text-xs font-semibold text-emerald-700 underline underline-offset-4">
-                  Voir le rapport
+                <button
+                  onClick={downloadReport}
+                  className="mt-2 flex items-center gap-1 text-xs font-semibold text-emerald-700 underline underline-offset-4"
+                >
+                  <Download className="h-3.5 w-3.5" /> Télécharger le rapport
+                  (CSV)
                 </button>
               </div>
               <div className="rounded-2xl border border-slate-200 bg-white p-5 text-center shadow-sm">
@@ -2738,7 +3367,7 @@ function Dashboard({
                           : action.label === "Historique" ||
                               action.label === "Factures"
                             ? "panel-transactions"
-                            : "panel-budget"
+                            : "panel-notifications"
                       )
                     }
                     className="flex items-center gap-3 rounded-xl border border-slate-200 p-3 text-left hover:bg-slate-50"
@@ -2783,6 +3412,13 @@ function Dashboard({
             <div id="panel-assistant">
               <AssistantPanel token={subscriber.accessToken} />
             </div>
+            <div id="panel-notifications" className="xl:col-span-2">
+              <NotificationsPanel
+                token={subscriber.accessToken}
+                channels={data.notifications}
+                onDone={refresh}
+              />
+            </div>
           </div>
           {/* Footer : technologies + statut */}
           <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -2823,16 +3459,18 @@ function Dashboard({
               </h3>
               <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
                 <span className="flex items-center gap-1.5 text-slate-600">
-                  <CircleCheck className="h-3.5 w-3.5 text-emerald-600" />{" "}
-                  Disponibilité 99,8%
+                  <CircleCheck
+                    className={`h-3.5 w-3.5 ${online ? "text-emerald-600" : "text-red-500"}`}
+                  />{" "}
+                  Compteur {online ? "en ligne" : "hors ligne"}
                 </span>
                 <span className="flex items-center gap-1.5 text-slate-600">
                   <RefreshCw className="h-3.5 w-3.5 text-emerald-600" /> Mise à
                   jour : 5 s
                 </span>
                 <span className="flex items-center gap-1.5 text-slate-600">
-                  <Timer className="h-3.5 w-3.5 text-emerald-600" /> Latence 39
-                  ms
+                  <Timer className="h-3.5 w-3.5 text-emerald-600" /> Signal GSM{" "}
+                  {signal}%
                 </span>
                 <span className="flex items-center gap-1.5 text-slate-600">
                   <LockKeyhole className="h-3.5 w-3.5 text-emerald-600" />{" "}
@@ -2849,7 +3487,7 @@ function Dashboard({
       </div>
       {/* Confirmation dialog for the relay command */}
       <Dialog open={confirm} onOpenChange={setConfirm}>
-        <DialogContent className="max-w-md rounded-xl border-slate-200 p-0">
+        <DialogContent className="rounded-xl border-slate-200 p-0 sm:max-w-md">
           <div className="p-6">
             <DialogHeader>
               <DialogTitle className="text-xl font-bold">
@@ -2863,9 +3501,15 @@ function Dashboard({
               <Button
                 disabled={submittingCommand}
                 onClick={submitRelay}
-                className="bg-red-600 hover:bg-red-700"
+                className={
+                  relayOn
+                    ? "bg-red-600 hover:bg-red-700"
+                    : "bg-emerald-600 hover:bg-emerald-700"
+                }
               >
-                Confirmer l’isolement
+                {relayOn
+                  ? "Confirmer l’isolement"
+                  : "Confirmer le rétablissement"}
               </Button>
             </DialogFooter>
           </div>
@@ -2899,7 +3543,35 @@ export default function Home() {
       accessToken: session.accessToken,
     });
   };
+  // Reconnexion automatique : le cookie HTTP-only vse_refresh rouvre la session après
+  // un rechargement de page, sans ressaisir le code compteur.
+  useEffect(() => {
+    if (previewMode) return;
+    let active = true;
+    refreshSubscriberSession()
+      .then(session => {
+        if (!active) return;
+        setSubscriber(
+          current =>
+            current ?? {
+              firstName: session.subscriber.firstName,
+              lastName: session.subscriber.lastName,
+              meterCode: "",
+              accessToken: session.accessToken,
+            }
+        );
+      })
+      .catch(() => {
+        // Aucune session persistante : l'accueil public reste affiché.
+      });
+    return () => {
+      active = false;
+    };
+  }, [previewMode]);
   const leave = () => {
+    // Efface aussi le cookie de session côté serveur, sinon la reconnexion
+    // automatique rouvrirait l'espace abonné après « Se déconnecter ».
+    void logoutSubscriber();
     clearSubscriberSession();
     setSubscriber(null);
   };

@@ -6,6 +6,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from .models import NewsArticle, Recharge, Telemetry
+from .notifications import to_e164
 
 
 class TelemetryPayloadSerializer(serializers.Serializer):
@@ -23,6 +24,9 @@ class TelemetryPayloadSerializer(serializers.Serializer):
     signal_strength = serializers.IntegerField(min_value=0, max_value=100)
     device_status = serializers.ChoiceField(choices=["ONLINE", "OFFLINE"])
     firmware_version = serializers.CharField(max_length=32)
+    # Optionnel : identifiants des recharges que le compteur a déjà intégrées à son solde
+    # local (accusé de réception des crédits reçus dans une réponse précédente).
+    credit_acks = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False, max_length=50)
 
     def validate(self, attrs):
         # Cohérence physique : P <= V x I (tolérance 15 % pour facteur de puissance)
@@ -60,6 +64,24 @@ class SubscriberLoginSerializer(serializers.Serializer):
         if len(attrs["first_name"].strip()) < 2 or len(attrs["last_name"].strip()) < 2:
             raise serializers.ValidationError("Le nom et le prénom doivent contenir au moins deux caractères.")
         return attrs
+
+
+class AdminLoginSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=150)
+    password = serializers.CharField(max_length=128, trim_whitespace=False)
+
+
+class SubscriberProfileSerializer(serializers.Serializer):
+    """Coordonnées utilisées pour les alertes e-mail, SMS et WhatsApp."""
+
+    email = serializers.EmailField(required=False, allow_blank=True)
+    phone = serializers.CharField(max_length=24, required=False, allow_blank=True, trim_whitespace=True)
+    address = serializers.CharField(max_length=255, required=False, allow_blank=True, trim_whitespace=True)
+
+    def validate_phone(self, value):
+        if value and not to_e164(value):
+            raise serializers.ValidationError("Numéro invalide : utilisez le format 0993 456 789 ou +243 993 456 789.")
+        return value
 
 
 class TokenRefreshSerializer(serializers.Serializer):

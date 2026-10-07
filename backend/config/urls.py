@@ -6,6 +6,10 @@ from django.urls import include, path, re_path
 from rest_framework.routers import DefaultRouter
 
 from energy.views import (
+    AdminLoginView,
+    AlertAcknowledgeView,
+    NotificationTestView,
+    SubscriberProfileView,
     AdminOverviewView,
     AssistantView,
     BudgetView,
@@ -46,6 +50,7 @@ def frontend_file(request, file_name="index.html"):
 urlpatterns = [
     path("api/iot/telemetry", TelemetryIngestView.as_view(), name="iot-telemetry"),
     path("api/auth/subscriber/login/", SubscriberLoginView.as_view(), name="subscriber-login"),
+    path("api/auth/admin/login/", AdminLoginView.as_view(), name="admin-login"),
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("api/auth/subscriber/logout/", SubscriberLogoutView.as_view(), name="subscriber-logout"),
     path("api/recharges/manual/issue/", ManualTokenIssueView.as_view(), name="manual-token-issue"),
@@ -57,6 +62,9 @@ urlpatterns = [
     path("api/payments/pawapay/status/<str:deposit_id>/", PawaPayDepositStatusView.as_view(), name="pawapay-status"),
     path("api/relay/commands/", RelayCommandView.as_view(), name="relay-commands"),
     path("api/assistant/", AssistantView.as_view(), name="assistant"),
+    path("api/alerts/<int:alert_id>/ack/", AlertAcknowledgeView.as_view(), name="alert-ack"),
+    path("api/profile/", SubscriberProfileView.as_view(), name="profile"),
+    path("api/notifications/test/", NotificationTestView.as_view(), name="notification-test"),
     path("api/budget/", BudgetView.as_view(), name="budget"),
     path("api/admin/overview/", AdminOverviewView.as_view(), name="admin-overview"),
     path("api/receipts/<str:recharge_id>/", ReceiptView.as_view(), name="receipt"),

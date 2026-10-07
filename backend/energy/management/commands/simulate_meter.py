@@ -19,7 +19,7 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from energy.models import Meter, Sector
+from energy.models import Meter, Recharge, Sector
 from energy.services import compute_signature
 
 FIRMWARE_VERSION = "1.0.0"
@@ -93,7 +93,7 @@ def seed_demo_history(meter: Meter, hours: int = 168) -> int:
 
 def build_payload(meter_id: str, state: dict) -> dict:
     """Construit un payload conforme au contrat de télémétrie du prompt."""
-    return {
+    payload = {
         "message_id": str(uuid.uuid4()),
         "meter_id": meter_id,
         "device_timestamp": timezone.now().isoformat(),
@@ -107,6 +107,10 @@ def build_payload(meter_id: str, state: dict) -> dict:
         "device_status": "ONLINE",
         "firmware_version": FIRMWARE_VERSION,
     }
+    # Accusé de réception des crédits déjà intégrés au solde local.
+    if state.get("applied_credits"):
+        payload["credit_acks"] = sorted(state["applied_credits"])
+    return payload
 
 
 class Command(BaseCommand):
@@ -118,7 +122,7 @@ class Command(BaseCommand):
         parser.add_argument("--count", type=int, default=0, help="Nombre d'envois (0 = illimité).")
         parser.add_argument("--base-url", default=os.getenv("VSE_BASE_URL", "http://127.0.0.1:8000"), help="URL du backend Django.")
         parser.add_argument("--initial-balance", type=float, default=18.42, help="Solde initial du compteur simulé (kWh).")
-        parser.add_argument("--no-seed-history", action="store_true", help="Ne pas pré-remplir l'historique de démonstration (24 h).")
+        parser.add_argument("--no-seed-history", action="store_true", help="Ne pas pré-remplir l'historique de démonstration (7 jours).")
 
     def handle(self, *args, **options):
         meter_id = options["meter"]
@@ -156,14 +160,24 @@ class Command(BaseCommand):
             else:
                 self.stdout.write(self.style.WARNING("[SIMULATEUR DEMO] Historique déjà présent (2 h récentes) : aucune duplication."))
 
+        # Le compteur simulé redémarre dans l'état connu du backend. Les recharges pas encore
+        # transmises sont exclues du solde local : elles arriveront par `credit_kwh` à la
+        # première télémétrie (sinon elles seraient comptées deux fois).
+        meter.refresh_from_db()
+        undelivered = sum(
+            float(recharge.energy_kwh)
+            for recharge in meter.recharges.filter(status=Recharge.STATUS_APPLIED, delivered_at__isnull=True)
+        )
         state = {
             "voltage": 220.4,
             "current": 2.31,
             "power": 508.2,
             "energy_kwh": float(meter.energy_kwh),
-            "balance_kwh": float(meter.balance_kwh),
-            "relay_status": True,
+            "balance_kwh": max(float(meter.balance_kwh) - undelivered, 0.0),
+            "relay_status": meter.relay_status == "ON",
             "signal_strength": 76,
+            # Crédits intégrés au solde local et pas encore confirmés par le backend.
+            "applied_credits": set(),
         }
         sent = 0
         try:
@@ -173,19 +187,21 @@ class Command(BaseCommand):
                 t = time.time()
                 power = 350 + 280 * (0.5 + 0.5 * math.sin(t / 30.0)) + random.uniform(-25, 25)
                 voltage = 220.4 + random.uniform(-4, 4)
+                # Relais ouvert : la tension reste présente en amont, mais aucune charge n'est alimentée.
+                if not state["relay_status"]:
+                    power = 0.0
                 current = power / max(voltage, 1)
                 state["power"] = max(power, 0)
                 state["voltage"] = max(voltage, 0)
                 state["current"] = max(current, 0)
                 # W -> kWh : diviser par 1000 (sinon la consommation explose)
-                state["energy_kwh"] += power * (interval / 3600.0) / 1000.0
-                # Consommation débitée du solde ; coupure automatique si épuisé
-                if state["relay_status"]:
-                    state["balance_kwh"] = max(state["balance_kwh"] - power * (interval / 3600.0) / 1000.0, 0)
+                consumed = state["power"] * (interval / 3600.0) / 1000.0
+                state["energy_kwh"] += consumed
+                # Consommation débitée du solde ; coupure locale immédiate si épuisé.
+                # Le rétablissement, lui, vient du backend (relay_command) après une recharge.
+                state["balance_kwh"] = max(state["balance_kwh"] - consumed, 0)
                 if state["balance_kwh"] <= 0:
                     state["relay_status"] = False
-                elif state["balance_kwh"] > 0.05:
-                    state["relay_status"] = True
                 state["signal_strength"] = max(20, min(95, state["signal_strength"] + random.randint(-3, 3)))
 
                 payload = build_payload(meter_id, state)
@@ -201,7 +217,20 @@ class Command(BaseCommand):
                         body = json.loads(response.read().decode("utf-8"))
                         http_status = response.status
                     status_line = f"[{sent}] HTTP {http_status} accepted={body.get('accepted')}"
+                    # Le compteur applique ce que le backend lui renvoie : crédit des recharges
+                    # et ordre de relais (règle de solde ou commande de l'abonné).
+                    # Un crédit est appliqué une seule fois (par identifiant), puis accusé dans la
+                    # télémétrie suivante ; le backend le renvoie tant qu'il n'a pas reçu l'accusé.
+                    listed = set()
+                    for credit in body.get("credits") or []:
+                        listed.add(credit["id"])
+                        if credit["id"] not in state["applied_credits"]:
+                            state["applied_credits"].add(credit["id"])
+                            state["balance_kwh"] += float(credit["energy_kwh"])
+                            status_line += f" credit=+{credit['energy_kwh']} kWh (recharge {credit['id']})"
+                    state["applied_credits"] &= listed  # les autres sont confirmés
                     if body.get("relay_command"):
+                        state["relay_status"] = body["relay_command"].get("desired_state") == "ON"
                         status_line += f" relay_command={body['relay_command']}"
                     self.stdout.write(self.style.SUCCESS(status_line))
                 except Exception as exc:

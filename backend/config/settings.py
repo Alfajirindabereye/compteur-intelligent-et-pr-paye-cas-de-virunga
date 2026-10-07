@@ -1,11 +1,10 @@
 import os
+import secrets
+import warnings
 from pathlib import Path
 from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", os.getenv("JWT_SECRET", "development-only-change-me"))
-DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() == "true"
-ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",") if host.strip()]
 
 # ---------------------------------------------------------------------------
 # Mini-lecteur de .env (stdlib uniquement). Aucun secret n'est stocké en dur :
@@ -15,22 +14,52 @@ ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "*")
 def _load_dotenv(path):
     if not os.path.exists(path):
         return
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
+# Chargé AVANT toute lecture d'environnement : sinon DJANGO_SECRET_KEY,
+# DJANGO_DEBUG et DJANGO_ALLOWED_HOSTS placés dans .env seraient ignorés.
 _load_dotenv(BASE_DIR / ".env")
+
+DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() == "true"
+TESTING = os.getenv("DJANGO_TESTING") == "true"
+ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",") if host.strip()]
+
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY") or os.getenv("JWT_SECRET") or ""
+if not SECRET_KEY:
+    if DEBUG or TESTING:
+        SECRET_KEY = "development-only-change-me"
+    else:
+        # Une clé par défaut connue permettrait de forger des JWT (y compris administrateur).
+        # Sans clé configurée, on en tire une aléatoire : les sessions ne survivent pas au redémarrage.
+        SECRET_KEY = secrets.token_urlsafe(48)
+        warnings.warn("DJANGO_SECRET_KEY n'est pas défini : clé aléatoire éphémère utilisée (sessions perdues à chaque redémarrage).")
 
 # --- Agent IA DeepSeek (endpoint OpenAI-compatible) ---
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp")
+# « deepseek-v4-flash-vision-exp » est un nom retiré (encore accepté, mais redirigé) : nom courant par défaut.
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 DEEPSEEK_TIMEOUT = float(os.getenv("DEEPSEEK_TIMEOUT", "30"))
 
+# --- Notifications e-mail : SMTP Gmail par défaut (mot de passe d'application Google) ---
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "true").lower() == "true"
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_TIMEOUT = 15
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "") or EMAIL_HOST_USER or "no-reply@virunga-smart-energy.demo"
+
 INSTALLED_APPS = [
+    # En tête de liste : `manage.py runserver` sert alors l'ASGI (HTTP + WebSocket /ws/telemetry/).
+    "daphne",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -72,9 +101,9 @@ TEMPLATES = [
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 parsed = urlparse(DATABASE_URL) if DATABASE_URL else None
 
-if os.getenv("DJANGO_TESTING") == "true":
+if TESTING:
     DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}
-elif parsed and parsed.scheme == "postgres":
+elif parsed and parsed.scheme in ("postgres", "postgresql"):
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
@@ -116,4 +145,6 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
+    # Frein aux essais de mots de passe sur la connexion administrateur.
+    "DEFAULT_THROTTLE_RATES": {"admin_login": "10/min", "notification_test": "5/min"},
 }

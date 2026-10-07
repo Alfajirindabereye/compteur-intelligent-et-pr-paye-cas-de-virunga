@@ -14,6 +14,8 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // Le premier rendu jsdom de la page d'accueil dépasse 5 s sur une machine modeste.
+    testTimeout: 20000,
     include: ["server/**/*.test.ts", "server/**/*.spec.ts", "client/**/*.test.ts", "client/**/*.spec.ts", "client/**/*.test.tsx", "client/**/*.spec.tsx"],
     environmentMatchGlobs: [["client/**/*.test.{ts,tsx}", "jsdom"]],
     server: {

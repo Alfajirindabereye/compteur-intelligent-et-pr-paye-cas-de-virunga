@@ -38,13 +38,22 @@ const dashboard = {
 const mocks = vi.hoisted(() => ({
   loginSubscriber: vi.fn().mockResolvedValue({ accessToken: "subscriber-token", subscriber: { firstName: "Amani", lastName: "Kambale", meterId: "VSF-000001" } }),
   requestRelayCommand: vi.fn().mockResolvedValue({ id: 1, status: "PENDING", desired_state: "OFF" }),
+  refreshSubscriberSession: vi.fn().mockRejectedValue(new Error("Aucune session persistante")),
+  acknowledgeAlert: vi.fn().mockResolvedValue({ acknowledged: true, open_alerts: 0 }),
+  extra: {} as Record<string, unknown>,
 }));
 
 vi.mock("@/lib/djangoEnergy", () => ({
   clearSubscriberSession: vi.fn(),
+  getProfile: vi.fn().mockResolvedValue({ email: "", phone: "", channels: { email: "not_configured", sms: "not_configured", whatsapp: "not_configured" } }),
+  updateProfile: vi.fn(),
+  sendTestNotification: vi.fn(),
+  acknowledgeAlert: mocks.acknowledgeAlert,
+  logoutSubscriber: vi.fn().mockResolvedValue(undefined),
+  refreshSubscriberSession: mocks.refreshSubscriberSession,
   loginSubscriber: mocks.loginSubscriber,
   requestRelayCommand: mocks.requestRelayCommand,
-  useDjangoDashboard: () => ({ data: { ...dashboard, relay_command: mocks.requestRelayCommand.mock.calls.length ? { id: 1, status: "PENDING", desired_state: "OFF" } : null }, isLoading: false, error: null }),
+  useDjangoDashboard: () => ({ data: { ...dashboard, ...mocks.extra, relay_command: mocks.requestRelayCommand.mock.calls.length ? { id: 1, status: "PENDING", desired_state: "OFF" } : null }, isLoading: false, error: null }),
   useLocalNews: () => ({ data: [], isLoading: false, error: null }),
 }));
 
@@ -52,6 +61,10 @@ afterEach(() => {
   cleanup();
   mocks.loginSubscriber.mockClear();
   mocks.requestRelayCommand.mockClear();
+  mocks.refreshSubscriberSession.mockReset();
+  mocks.extra = {};
+  mocks.acknowledgeAlert.mockClear();
+  mocks.refreshSubscriberSession.mockRejectedValue(new Error("Aucune session persistante"));
 });
 
 describe("public and subscriber UI", () => {
@@ -107,5 +120,54 @@ describe("public and subscriber UI", () => {
     expect(screen.getAllByText("DONNÉES DEMO").length).toBeGreaterThanOrEqual(2);
     // Deux camemberts SVG rendus
     expect(screen.getAllByRole("img", { name: "Répartition de la consommation" })).toHaveLength(2);
+  });
+
+  it("reopens the subscriber dashboard from the persistent session cookie", async () => {
+    mocks.refreshSubscriberSession.mockResolvedValue({ accessToken: "refreshed-token", subscriber: { firstName: "Amani", lastName: "Kambale", meterId: "VSF-000001" } });
+    render(<Home />);
+
+    expect(await screen.findByText("État du compteur et crédit prépayé")).toBeInTheDocument();
+    expect(screen.getByText(/Bonjour, Amani Kambale/)).toBeInTheDocument();
+    expect(mocks.loginSubscriber).not.toHaveBeenCalled();
+  });
+
+  it("shows today's estimated cost from consumption, not the remaining balance", async () => {
+    mocks.refreshSubscriberSession.mockResolvedValue({ accessToken: "refreshed-token", subscriber: { firstName: "Amani", lastName: "Kambale", meterId: "VSF-000001" } });
+    render(<Home />);
+
+    const label = await screen.findByText("Coût estimé aujourd'hui");
+    // 4,9 kWh consommés × (6,3 US$ / 18,42 kWh) ≈ 1,68 US$ — et non le solde de 6,3 US$
+    expect(label.closest("div")?.parentElement).toHaveTextContent("1,68");
+  });
+
+  it("shows the degressive credit level and acknowledges an alert through Django", async () => {
+    mocks.refreshSubscriberSession.mockResolvedValue({ accessToken: "refreshed-token", subscriber: { firstName: "Amani", lastName: "Kambale", meterId: "VSF-000001" } });
+    mocks.extra = {
+      credit: { percent: 4.2, reference_kwh: 20, threshold: 5, thresholds: [15, 10, 5, 3, 1] },
+      alerts: [{ id: 7, kind: "CREDIT_SEUIL_5", severity: "CRITICAL", message: "Crédit à 4 % (seuil 5 %)." }],
+    };
+    const user = userEvent.setup();
+    render(<Home />);
+
+    const level = await screen.findByRole("status", { name: "Niveau de crédit" });
+    expect(level).toHaveTextContent("4,2 %");
+    expect(level).toHaveTextContent("Seuil 5 % franchi");
+    expect(screen.getByText("Crédit à 4 % (seuil 5 %).")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Marquer lue" }));
+    expect(mocks.acknowledgeAlert).toHaveBeenCalledWith("refreshed-token", 7);
+  });
+
+  it("leaves no dashboard button without an action", async () => {
+    mocks.refreshSubscriberSession.mockResolvedValue({ accessToken: "refreshed-token", subscriber: { firstName: "Amani", lastName: "Kambale", meterId: "VSF-000001" } });
+    render(<Home />);
+    await screen.findByText("État du compteur et crédit prépayé");
+
+    // React attache le gestionnaire dans les props internes du nœud DOM.
+    const dead = screen.getAllByRole("button").filter(button => {
+      const propsKey = Object.keys(button).find(key => key.startsWith("__reactProps$"));
+      const props = propsKey ? (button as unknown as Record<string, { onClick?: unknown; type?: string }>)[propsKey] : {};
+      return !props.onClick && props.type !== "submit";
+    });
+    expect(dead.map(button => button.textContent)).toEqual([]);
   });
 });

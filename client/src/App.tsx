@@ -4,6 +4,7 @@ import NotFound from "@/pages/NotFound";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import { useButtonRipple } from "./hooks/useButtonRipple";
 import Home from "./pages/Home";
 import Admin from "./pages/Admin";
 
@@ -26,6 +27,7 @@ function Router() {
 // - If you want to make theme switchable, pass `switchable` ThemeProvider and use `useTheme` hook
 
 function App() {
+  useButtonRipple();
   return (
     <ErrorBoundary>
       <ThemeProvider

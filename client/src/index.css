@@ -218,3 +218,59 @@
 .dark .bg-slate-900 { background-color: #020817; }
 .dark .bg-slate-800\/70 { background-color: rgba(30, 41, 59, 0.75); }
 .dark .text-slate-300 { color: #cbd5e1; }
+
+/* ===========================================================================
+   Micro-animations : onde lumineuse au clic sur les boutons et légendes du
+   carrousel. Désactivées si l'utilisateur demande moins d'animations.
+   =========================================================================== */
+.btn-ripple-host {
+  position: fixed;
+  z-index: 9999;
+  overflow: hidden;
+  pointer-events: none;
+  animation: btn-ripple-glow 650ms ease-out forwards;
+}
+.btn-ripple-wave {
+  position: absolute;
+  border-radius: 9999px;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.55) 0%, rgba(52, 211, 153, 0.32) 42%, transparent 70%);
+  transform: scale(0);
+  animation: btn-ripple-wave 650ms ease-out forwards;
+}
+@keyframes btn-ripple-wave {
+  to { transform: scale(1); opacity: 0; }
+}
+@keyframes btn-ripple-glow {
+  0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55); }
+  100% { box-shadow: 0 0 0 10px rgba(52, 211, 153, 0); }
+}
+
+.carousel-caption {
+  animation: carousel-caption-in 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes carousel-caption-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.chart-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: chart-draw 1100ms ease-out forwards;
+}
+@keyframes chart-draw {
+  to { stroke-dashoffset: 0; }
+}
+.chart-bar {
+  transform-box: fill-box;
+  transform-origin: bottom;
+  animation: chart-bar-grow 600ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes chart-bar-grow {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .carousel-caption, .chart-draw, .chart-bar { animation: none; stroke-dashoffset: 0; }
+}

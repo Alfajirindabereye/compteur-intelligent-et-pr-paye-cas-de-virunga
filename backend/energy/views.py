@@ -8,30 +8,34 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import jwt
-from asgiref.sync import async_to_sync
-from channels.layers import get_channel_layer
 from django.conf import settings
-from django.contrib.auth import get_user_model
+from django.contrib.auth import authenticate, get_user_model
 from django.db import IntegrityError, OperationalError, transaction
+from django.db.models import Count, Q
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status, viewsets
-from rest_framework.authentication import SessionAuthentication
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from .models import BudgetSetting, Meter, NewsArticle, PaymentEvent, Recharge, RelayCommand, Telemetry
+from .authentication import jwt_secret
+from .notifications import dispatch_alerts, notification_channels, send_notification
+from .models import Alert, BudgetSetting, Meter, NewsArticle, PaymentEvent, Recharge, RelayCommand, Sector, Telemetry
 from .serializers import (
+    AdminLoginSerializer,
     ManualTokenApplySerializer,
     ManualTokenIssueSerializer,
     NewsArticleSerializer,
     PaymentInitiateSerializer,
     RelayCommandRequestSerializer,
     SubscriberLoginSerializer,
+    SubscriberProfileSerializer,
     TelemetryPayloadSerializer,
     TokenRefreshSerializer,
 )
@@ -43,9 +47,10 @@ from .services import (
     apply_relay_rule,
     assistant_answer,
     assistant_system_prompt,
+    CREDIT_THRESHOLDS,
     check_heartbeats,
     complete_pending_recharge,
-    compute_signature,
+    credit_status,
     deepseek_chat,
     detect_anomalies,
     estimate_hours,
@@ -53,6 +58,8 @@ from .services import (
     issue_manual_token,
     notify_telemetry_refresh,
     parse_manual_token,
+    payment_covers_recharge,
+    pending_credits,
     pending_recharge_by_reference,
     verify_signature,
 )
@@ -135,15 +142,15 @@ def subscriber_meter_for(user):
     return Meter.objects.select_related("sector").filter(owner_open_id=user.username).first()
 
 
-def _issue_token_pair(user, meter) -> dict:
+def _issue_token_pair(user, meter) -> tuple[str, str]:
     now = timezone.now()
     access = jwt.encode(
         {"sub": user.username, "meter_id": meter.meter_id, "domain_role": "abonné", "jti": str(uuid.uuid4()), "iat": now, "exp": now + ACCESS_TOKEN_TTL},
-        os.getenv("JWT_SECRET", settings.SECRET_KEY), algorithm="HS256",
+        jwt_secret(), algorithm="HS256",
     )
     refresh = jwt.encode(
         {"sub": user.username, "typ": "refresh", "jti": str(uuid.uuid4()), "iat": now, "exp": now + REFRESH_TOKEN_TTL},
-        os.getenv("JWT_SECRET", settings.SECRET_KEY), algorithm="HS256",
+        jwt_secret(), algorithm="HS256",
     )
     return access, refresh
 
@@ -183,20 +190,22 @@ class TelemetryIngestView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
+        # Signature HMAC d'abord : vérifiée sur le payload BRUT reçu (ce que le compteur a signé),
+        # jamais sur la version re-sérialisée par DRF. Un appelant non authentifié n'obtient
+        # ainsi aucun détail de validation.
+        if not verify_signature(request.data, request.headers.get("X-Virunga-Signature", "")):
+            return Response({"accepted": False, "error": "Signature HMAC invalide."}, status=status.HTTP_401_UNAUTHORIZED)
+
         serializer = TelemetryPayloadSerializer(data=request.data)
         if not serializer.is_valid():
             return Response({"accepted": False, "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
         payload = serializer.validated_data
-        # Unicité du message_id : le champ est unique en base (rejet 409).
-        # Signature HMAC : vérifiée sur le payload BRUT reçu (ce que le compteur a signé),
-        # jamais sur la version re-sérialisée par DRF. Tout payload invalide est rejeté.
-        if not verify_signature(request.data, request.headers.get("X-Virunga-Signature", "")):
-            return Response({"accepted": False, "error": "Signature HMAC invalide."}, status=status.HTTP_401_UNAUTHORIZED)
-
+        reported_relay = RelayCommand.ON if payload["relay_status"] else RelayCommand.OFF
         try:
             with transaction.atomic():
                 meter = Meter.objects.select_for_update().get(meter_id=payload["meter_id"])
+                # Unicité du message_id : le champ est unique en base (rejet 409).
                 telemetry = Telemetry.objects.create(
                     meter=meter,
                     message_id=str(payload["message_id"]),
@@ -206,27 +215,32 @@ class TelemetryIngestView(APIView):
                     power_w=payload["power"],
                     energy_kwh=payload["energy_consumed"],
                     balance_kwh=payload["balance_kwh"],
-                    relay_status="ON" if payload["relay_status"] else "OFF",
+                    relay_status=reported_relay,
                     signal_gsm=payload["signal_strength"],
                 )
+                # Le compteur rapporte son solde local ; on y ajoute les recharges appliquées
+                # côté serveur qu'il n'a pas encore confirmées (sinon elles seraient écrasées ici).
+                credits = pending_credits(meter, payload.get("credit_acks") or [])
+                credit_kwh = sum((recharge.energy_kwh for recharge in credits), Decimal("0"))
                 meter.voltage_v = payload["voltage"]
                 meter.current_a = payload["current"]
                 meter.power_w = payload["power"]
                 meter.energy_kwh = payload["energy_consumed"]
-                meter.balance_kwh = payload["balance_kwh"]
+                meter.balance_kwh = Decimal(str(payload["balance_kwh"])) + credit_kwh
                 meter.signal_gsm = payload["signal_strength"]
                 meter.device_status = payload["device_status"]
                 meter.firmware_version = payload["firmware_version"]
                 meter.save()
-                # Coupure / rétablissement automatique selon le solde
-                desired_relay = apply_relay_rule(meter)
+                # Coupure / rétablissement automatique selon le solde et la commande de l'abonné
+                apply_relay_rule(meter)
                 pending_command = meter.relay_commands.filter(status=RelayCommand.PENDING).first()
-                if pending_command and pending_command.requested_state == ("ON" if payload["relay_status"] else "OFF"):
+                if pending_command and pending_command.requested_state == reported_relay:
                     pending_command.status = RelayCommand.APPLIED
                     pending_command.acknowledged_at = timezone.now()
                     pending_command.save(update_fields=["status", "acknowledged_at"])
+                    pending_command = None
                 # Détection d'anomalies sur les données reçues
-                detect_anomalies(meter, payload)
+                new_alerts = detect_anomalies(meter, payload)
         except Meter.DoesNotExist:
             return Response({"accepted": False, "error": "Compteur inconnu."}, status=status.HTTP_404_NOT_FOUND)
         except IntegrityError:
@@ -237,11 +251,25 @@ class TelemetryIngestView(APIView):
 
         check_heartbeats()
         notify_telemetry_refresh(meter)
+        # Alertes de crédit poussées vers l'abonné (e-mail, SMS, WhatsApp), hors transaction.
+        dispatch_alerts(meter, new_alerts)
 
+        # Ordre renvoyé au compteur dès que son relais diffère de l'état voulu.
         relay_command = None
-        if meter.relay_status != ("ON" if payload["relay_status"] else "OFF"):
-            relay_command = {"command_id": f"auto-{telemetry.id}", "desired_state": meter.relay_status, "reason": "regle_solde"}
-        return Response({"accepted": True, "message_id": str(telemetry.message_id), "relay_command": relay_command}, status=status.HTTP_202_ACCEPTED)
+        if meter.relay_status != reported_relay:
+            if pending_command and pending_command.requested_state == meter.relay_status:
+                relay_command = {"command_id": str(pending_command.id), "desired_state": meter.relay_status, "reason": "commande_abonne"}
+            else:
+                relay_command = {"command_id": f"auto-{telemetry.id}", "desired_state": meter.relay_status, "reason": "regle_solde"}
+        return Response({
+            "accepted": True,
+            "message_id": str(telemetry.message_id),
+            "relay_command": relay_command,
+            # Crédits à intégrer au solde local, à accuser ensuite par `credit_acks` (une fois par id).
+            "credits": [{"id": recharge.id, "energy_kwh": float(recharge.energy_kwh)} for recharge in credits],
+            "credit_kwh": float(credit_kwh),
+            "balance_kwh": float(meter.balance_kwh),
+        }, status=status.HTTP_202_ACCEPTED)
 
 
 class SubscriberLoginView(APIView):
@@ -299,6 +327,34 @@ class SubscriberLoginView(APIView):
         return response
 
 
+class AdminLoginView(APIView):
+    """Connexion administrateur : compte Django `is_staff` (créé par `manage.py createsuperuser`)."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "admin_login"
+
+    def post(self, request):
+        serializer = AdminLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = authenticate(request, username=serializer.validated_data["username"], password=serializer.validated_data["password"])
+        # Même réponse pour un mot de passe faux et un compte non administrateur.
+        if user is None or not user.is_staff:
+            return Response({"detail": "Identifiants administrateur invalides."}, status=status.HTTP_401_UNAUTHORIZED)
+        now = timezone.now()
+        access_token = jwt.encode(
+            {"sub": user.username, "domain_role": "administrateur", "jti": str(uuid.uuid4()), "iat": now, "exp": now + ACCESS_TOKEN_TTL},
+            jwt_secret(), algorithm="HS256",
+        )
+        return Response({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": int(ACCESS_TOKEN_TTL.total_seconds()),
+            "admin": {"username": user.username},
+        })
+
+
 class TokenRefreshView(APIView):
     """Rafraîchit la paire access + refresh (rotation du refresh token)."""
 
@@ -313,7 +369,7 @@ class TokenRefreshView(APIView):
         if not token:
             return Response({"detail": "Aucun refresh token fourni (corps ou cookie)."}, status=status.HTTP_401_UNAUTHORIZED)
         try:
-            payload = jwt.decode(token, os.getenv("JWT_SECRET", settings.SECRET_KEY), algorithms=["HS256"])
+            payload = jwt.decode(token, jwt_secret(), algorithms=["HS256"])
         except jwt.PyJWTError:
             return Response({"detail": "Refresh token invalide ou expiré."}, status=status.HTTP_401_UNAUTHORIZED)
         if payload.get("typ") != "refresh":
@@ -398,18 +454,21 @@ class ManualTokenApplyView(APIView):
                 return Response({"detail": "Token déjà utilisé (anti-rejeu)."}, status=status.HTTP_409_CONFLICT)
             record.used_at = timezone.now()
             record.save(update_fields=["used_at"])
+            # Même transaction que le marquage : un échec du crédit ne « brûle » pas le token.
+            # L'énergie créditée est celle enregistrée à l'émission, pas celle relue du token.
+            recharge = apply_recharge(locked_meter, Recharge.SOURCE_CHOICES[1][0], record.energy_kwh, record.used_at, provider_reference=f"token-seq-{record.sequence}", notify=False)
 
-        applied_at = timezone.now()
-        recharge = apply_recharge(locked_meter, Recharge.SOURCE_CHOICES[1][0], payload["energy_kwh"], applied_at, provider_reference=f"token-seq-{payload['sequence']}")
+        notify_telemetry_refresh(meter)
+        meter.refresh_from_db()
         return Response({
             "applied": True,
             "recharge_id": recharge.id,
             "source": recharge.source,
             "energy_kwh": float(recharge.energy_kwh),
-            "balance_kwh": float(locked_meter.balance_kwh),
+            "balance_kwh": float(meter.balance_kwh),
             "applied_at": recharge.applied_at.isoformat(),
             "synced_at": recharge.synced_at.isoformat(),
-            "relay_status": locked_meter.relay_status,
+            "relay_status": meter.relay_status,
         }, status=status.HTTP_202_ACCEPTED)
 
 
@@ -423,6 +482,11 @@ class PaymentInitiateView(APIView):
 
     permission_classes = [IsAuthenticated]
 
+    def _fail(self, recharge, detail: str, http_status: int) -> Response:
+        recharge.status = Recharge.STATUS_FAILED
+        recharge.save(update_fields=["status"])
+        return Response({"detail": detail}, status=http_status)
+
     def post(self, request):
         serializer = PaymentInitiateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -432,10 +496,12 @@ class PaymentInitiateView(APIView):
 
         provider = serializer.validated_data["provider"]
         amount_cdf = serializer.validated_data["amount_cdf"]
-        energy_kwh = (Decimal(amount_cdf) / CDF_PER_KWH).quantize(Decimal("0.001"))
-        reference = f"VSE-{meter.meter_id}-{uuid.uuid4().hex[:12]}"
+        # Arrondi vers le bas : l'énergie créditée ne dépasse jamais le montant payé.
+        energy_kwh = (Decimal(amount_cdf) / CDF_PER_KWH).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+        # PawaPay impose un depositId au format UUID ; Flutterwave accepte une référence libre.
+        reference = str(uuid.uuid4()) if provider == "pawapay" else f"VSE-{meter.meter_id}-{uuid.uuid4().hex[:12]}"
 
-        # Recharge en attente, traçable par référence (sera complétée par webhook)
+        # Recharge en attente, traçable par référence (sera complétée après confirmation du prestataire)
         recharge = Recharge.objects.create(
             meter=meter, source=Recharge.SOURCE_CHOICES[0][0], energy_kwh=energy_kwh,
             status=Recharge.STATUS_PENDING, applied_at=None, provider_reference=reference,
@@ -444,16 +510,12 @@ class PaymentInitiateView(APIView):
         if provider == "pawapay":
             token = os.getenv("PAWAPAY_SANDBOX_TOKEN", "")
             if not token:
-                recharge.status = Recharge.STATUS_FAILED
-                recharge.save(update_fields=["status"])
-                return Response({"detail": "PawaPay non configuré : aucun token sandbox fourni. Aucun paiement n'a été débité."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                return self._fail(recharge, "PawaPay non configuré : aucun token sandbox fourni. Aucun paiement n'a été débité.", status.HTTP_503_SERVICE_UNAVAILABLE)
             phone_raw = serializer.validated_data.get("phone_number", "")
             network = serializer.validated_data.get("network") or PAWAPAY_RDC_PROVIDERS[0]
             phone = _normalize_msisdn_for_cod(phone_raw)
             if not phone or not _valid_cod_msisdn(phone):
-                recharge.status = Recharge.STATUS_FAILED
-                recharge.save(update_fields=["status"])
-                return Response({"detail": "Numéro de téléphone mobile money invalide (format DRC attendu : 243 + 9 chiffres)."}, status=status.HTTP_400_BAD_REQUEST)
+                return self._fail(recharge, "Numéro de téléphone mobile money invalide (format DRC attendu : 243 + 9 chiffres).", status.HTTP_400_BAD_REQUEST)
             # Contrat réel PawaPay V2 : payer.accountDetails.{phoneNumber, provider} (voir docs.pawapay.io/v2)
             try:
                 status_code, body = _http_post_json(
@@ -470,26 +532,30 @@ class PaymentInitiateView(APIView):
                         "statementDescription": "Virunga Smart Energy - recharge",
                     },
                 )
-                deposit_status = body.get("status", "") if isinstance(body, dict) else ""
-                # Le dépôt est accepté pour traitement : l'abonné autorise ensuite sur SON téléphone (USSD).
-                accepted = isinstance(body, dict) and deposit_status.upper() in ("ACCEPTED", "SUBMITTED", "COMPLETED")
-                return Response({
-                    "provider": "pawapay", "deposit_id": reference, "http_status": status_code,
-                    "status": deposit_status, "accepted": accepted,
-                    "detail": "Demande de dépôt mobile money envoyée. Autorisez le paiement sur VOTRE téléphone (prompt USSD de l'opérateur)." if accepted else "Le dépôt n'a pas été accepté par PawaPay.",
-                }, status=status.HTTP_202_ACCEPTED if accepted else status.HTTP_502_BAD_GATEWAY)
             except Exception as exc:  # pragma: no cover - dépend du réseau
-                recharge.status = Recharge.STATUS_FAILED
-                recharge.save(update_fields=["status"])
-                return Response({"detail": f"Échec de l'appel PawaPay sandbox : {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+                return self._fail(recharge, f"Échec de l'appel PawaPay sandbox : {exc}", status.HTTP_502_BAD_GATEWAY)
+            deposit_status = str(body.get("status") or "") if isinstance(body, dict) else ""
+            # Le dépôt est accepté pour traitement : l'abonné autorise ensuite sur SON téléphone (USSD).
+            if deposit_status.upper() not in ("ACCEPTED", "SUBMITTED", "COMPLETED"):
+                # Refusé d'emblée : la recharge ne doit pas rester indéfiniment en attente.
+                return self._fail(recharge, "Le dépôt n'a pas été accepté par PawaPay. Aucun paiement n'a été débité.", status.HTTP_502_BAD_GATEWAY)
+            return Response({
+                "provider": "pawapay", "deposit_id": reference, "http_status": status_code,
+                "status": deposit_status, "accepted": True,
+                "detail": "Demande de dépôt mobile money envoyée. Autorisez le paiement sur VOTRE téléphone (prompt USSD de l'opérateur).",
+            }, status=status.HTTP_202_ACCEPTED)
 
         secret = os.getenv("FLUTTERWAVE_SECRET_KEY", "")
         if not secret:
-            recharge.status = Recharge.STATUS_FAILED
-            recharge.save(update_fields=["status"])
-            return Response({"detail": "Flutterwave non configuré : aucune clé sandbox fournie. Aucun paiement n'a été débité."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return self._fail(recharge, "Flutterwave non configuré : aucune clé sandbox fournie. Aucun paiement n'a été débité.", status.HTTP_503_SERVICE_UNAVAILABLE)
+        amount_usd = Decimal(amount_cdf) / CDF_PER_USD  # taux officiel 1 USD = 2500 FC
+        customer = {
+            "email": meter.subscriber_email or os.getenv("FLUTTERWAVE_CUSTOMER_EMAIL", f"{meter.meter_id}@virunga-smart-energy.demo"),
+            "name": f"{meter.subscriber_first_name} {meter.subscriber_last_name}".strip(),
+        }
+        if serializer.validated_data.get("phone_number"):
+            customer["phonenumber"] = serializer.validated_data["phone_number"]
         try:
-            amount_usd = float(Decimal(amount_cdf) / CDF_PER_USD)  # taux officiel 1 USD = 2500 FC
             status_code, body = _http_post_json(
                 FLUTTERWAVE_CHECKOUT,
                 {"Authorization": f"Bearer {secret}"},
@@ -498,18 +564,16 @@ class PaymentInitiateView(APIView):
                     "amount": f"{amount_usd:.2f}",
                     "currency": "USD",
                     "redirect_url": os.getenv("FLUTTERWAVE_REDIRECT_URL", "") or request.build_absolute_uri("/api/payments/flutterwave/verify/"),
-                    "customer": {
-                        "email": os.getenv("FLUTTERWAVE_CUSTOMER_EMAIL", f"{meter.meter_id}@virunga-smart-energy.demo"),
-                        "name": f"{meter.subscriber_first_name} {meter.subscriber_last_name}".strip(),
-                        "phonenumber": f"{serializer.validated_data.get('phone_number', '')}" if serializer.validated_data.get("phone_number") else None,
-                    },
+                    "customer": customer,
                 },
             )
-            return Response({"provider": "flutterwave", "tx_ref": reference, "http_status": status_code, "status": body.get("status"), "link": body.get("data", {}).get("link"), "detail": "En attente du webhook de confirmation."}, status=status.HTTP_202_ACCEPTED)
         except Exception as exc:  # pragma: no cover - dépend du réseau
-            recharge.status = Recharge.STATUS_FAILED
-            recharge.save(update_fields=["status"])
-            return Response({"detail": f"Échec de l'appel Flutterwave sandbox : {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+            return self._fail(recharge, f"Échec de l'appel Flutterwave sandbox : {exc}", status.HTTP_502_BAD_GATEWAY)
+        data = body.get("data") if isinstance(body, dict) else None
+        link = data.get("link") if isinstance(data, dict) else None
+        if not link:
+            return self._fail(recharge, "Flutterwave n'a pas fourni de page de paiement. Aucun paiement n'a été débité.", status.HTTP_502_BAD_GATEWAY)
+        return Response({"provider": "flutterwave", "tx_ref": reference, "http_status": status_code, "status": body.get("status"), "link": link, "detail": "Complétez le paiement sur la page sécurisée Flutterwave ; le crédit sera ajouté après confirmation."}, status=status.HTTP_202_ACCEPTED)
 
 
 class FlutterwaveWebhookView(APIView):
@@ -521,25 +585,26 @@ class FlutterwaveWebhookView(APIView):
     def post(self, request):
         configured_hash = os.getenv("FLW_SECRET_HASH", "")
         provided_hash = request.headers.get("verif-hash", "")
-        if not configured_hash or not provided_hash or not hmac.compare_digest(configured_hash, provided_hash):
+        if not configured_hash or not provided_hash or not hmac.compare_digest(configured_hash.encode(), provided_hash.encode()):
             return Response({"received": False, "error": "Signature webhook invalide."}, status=status.HTTP_401_UNAUTHORIZED)
 
-        body = request.data
-        event_id = str(body.get("webhook_id") or (body.get("data") or {}).get("id") or "")
+        body = request.data if isinstance(request.data, dict) else {}
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        event_id = str(body.get("webhook_id") or data.get("id") or "")
         if not event_id:
             return Response({"received": False, "error": "Identifiant d'événement manquant."}, status=status.HTTP_400_BAD_REQUEST)
 
         # Idempotence : un même événement est rejoué sans insertion multiple
         PaymentEvent.objects.update_or_create(
             event_id=f"flutterwave:{event_id}",
-            defaults={"provider": "FLUTTERWAVE", "status": str(body.get("data", {}).get("status") or body.get("event", "RECEIVED")), "payload": body},
+            defaults={"provider": "FLUTTERWAVE", "status": str(data.get("status") or body.get("event") or "RECEIVED"), "payload": body},
         )
 
-        tx_ref = str((body.get("data") or {}).get("tx_ref") or "")
-        event_type = body.get("event", "")
-        if tx_ref and ("success" in str((body.get("data") or {}).get("status", "")).lower() or event_type == "charge.success"):
+        tx_ref = str(data.get("tx_ref") or "")
+        if tx_ref and str(data.get("status") or "").lower() == "successful":
             recharge = pending_recharge_by_reference(tx_ref)
-            if recharge is not None:
+            # Crédit uniquement si le montant et la devise confirmés couvrent la recharge.
+            if recharge is not None and payment_covers_recharge(recharge, data.get("amount"), data.get("currency")):
                 complete_pending_recharge(recharge)
         return Response({"received": True}, status=status.HTTP_200_OK)
 
@@ -547,18 +612,22 @@ class FlutterwaveWebhookView(APIView):
 class FlutterwaveRedirectView(APIView):
     """Retour de la page hébergée Flutterwave (redirect_url) : vérifie via l'API Flutterwave
     et complète la recharge en attente. Contrat réel : GET /v3/transactions/{id}/verify.
-    Permet à la recharge carte Visa de se compléter SANS webhook externe (utile en local)."""
+    Permet à la recharge carte Visa de se compléter SANS webhook externe (utile en local).
+
+    Les paramètres de l'URL de retour sont contrôlés par le navigateur de l'abonné : ils ne
+    prouvent rien. Seule la réponse de l'API Flutterwave (appel serveur à serveur) crédite."""
 
     authentication_classes = []
     permission_classes = [AllowAny]
 
     def _html(self, message: str, ok: bool) -> HttpResponse:
         color = "#059669" if ok else "#dc2626"
+        title = "Paiement confirmé ✅" if ok else "Paiement non validé"
         return HttpResponse(
             f"<!doctype html><html lang='fr'><head><meta charset='utf-8'><title>Paiement — Virunga Smart Energy</title></head>"
             f"<body style='font-family:system-ui;text-align:center;padding:40px;background:#f8fafc'>"
             f"<div style='max-width:480px;margin:auto;background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:28px'>"
-            f"<h2 style='color:{color}'>Paiement {('confirmé' if ok else 'vérification')} ✅</h2>"
+            f"<h2 style='color:{color}'>{title}</h2>"
             f"<p>{message}</p>"
             f"<a href='/' style='display:inline-block;margin-top:16px;background:#059669;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none'>Retour à mon espace abonné</a>"
             f"</div></body></html>"
@@ -567,7 +636,6 @@ class FlutterwaveRedirectView(APIView):
     def get(self, request):
         tx_ref = str(request.query_params.get("tx_ref", ""))
         transaction_id = str(request.query_params.get("transaction_id", ""))
-        return_param_status = str(request.query_params.get("status", "")).lower()
         if not tx_ref:
             return self._html("Référence de transaction manquante : revenez à votre espace et réessayez.", False)
 
@@ -575,24 +643,27 @@ class FlutterwaveRedirectView(APIView):
         if recharge is None:
             return self._html("Aucune recharge en attente pour cette référence.", False)
 
-        verified = return_param_status in ("successful", "completed")
         secret = os.getenv("FLUTTERWAVE_SECRET_KEY", "")
-        if transaction_id and secret:
-            try:
-                status_code, body = _http_get_json(
-                    FLUTTERWAVE_VERIFY.format(id=transaction_id),
-                    {"Authorization": f"Bearer {secret}"},
-                )
-                data = body.get("data", {}) if isinstance(body, dict) else {}
-                if not isinstance(data, dict):
-                    data = {}
-                verified = str(data.get("status", "")).lower() == "successful"
-            except Exception:  # pragma: no cover - dépend du réseau
-                verified = verified  # repli honnête sur le statut de la redirection
-
+        if not secret or not transaction_id.isdigit():
+            return self._html("Le paiement n'a pas pu être vérifié auprès de Flutterwave. Aucun crédit n'a été ajouté.", False)
+        try:
+            _, body = _http_get_json(
+                FLUTTERWAVE_VERIFY.format(id=transaction_id),
+                {"Authorization": f"Bearer {secret}"},
+            )
+        except Exception:  # pragma: no cover - dépend du réseau
+            return self._html("Flutterwave est momentanément injoignable. Aucun crédit n'a été ajouté ; réessayez dans un instant.", False)
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, dict):
+            data = {}
+        verified = (
+            str(data.get("status", "")).lower() == "successful"
+            and str(data.get("tx_ref", "")) == tx_ref
+            and payment_covers_recharge(recharge, data.get("amount"), data.get("currency"))
+        )
         if verified:
             complete_pending_recharge(recharge)
-            recharge.meter.refresh_from_db()
+            recharge.refresh_from_db()
             return self._html(f"Votre recharge de {float(recharge.energy_kwh)} kWh a été appliquée. Nouveau solde : {float(recharge.meter.balance_kwh)} kWh.", True)
         return self._html("Le paiement n'a pas été confirmé par Flutterwave. Aucun crédit n'a été ajouté.", False)
 
@@ -617,14 +688,44 @@ def _pawapay_digest_ok(request) -> bool:
         digest = base64.b64encode(hashlib.sha512(body_bytes).digest())
     else:
         digest = base64.b64encode(hashlib.sha256(body_bytes).digest())
-    return hmac.compare_digest(digest.decode("ascii"), digest_b64)
+    return hmac.compare_digest(digest, digest_b64.encode("utf-8"))
+
+
+def _pawapay_fetch_deposit(deposit_id: str) -> tuple[int, dict]:
+    """Statut d'un dépôt lu directement chez PawaPay (GET /v2/deposits/{depositId}).
+
+    C'est la seule source de vérité avant de créditer : le callback entrant n'est pas
+    authentifié par un secret partagé, son contenu seul ne suffit donc pas.
+    """
+    token = os.getenv("PAWAPAY_SANDBOX_TOKEN", "")
+    status_code, body = _http_get_json(f"{PAWAPAY_SANDBOX_DEPOSITS}/{deposit_id}", {"Authorization": f"Bearer {token}"})
+    data = body.get("data", body) if isinstance(body, dict) else body
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return status_code, data if isinstance(data, dict) else {}
+
+
+def _settle_pawapay_deposit(recharge: Recharge, data: dict) -> str:
+    """Applique à la recharge le statut confirmé par PawaPay. Retourne APPLIED, FAILED, MISMATCH ou PENDING."""
+    deposit_status = str(data.get("status") or "").upper()
+    if deposit_status in ("COMPLETED", "SUCCESSFUL"):
+        same_deposit = str(data.get("depositId") or recharge.provider_reference) == recharge.provider_reference
+        if not same_deposit or not payment_covers_recharge(recharge, data.get("amount") or data.get("depositedAmount"), data.get("currency")):
+            return "MISMATCH"
+        complete_pending_recharge(recharge)
+        return "APPLIED"
+    if deposit_status in ("FAILED", "REJECTED"):
+        Recharge.objects.filter(pk=recharge.pk, status=Recharge.STATUS_PENDING).update(status=Recharge.STATUS_FAILED)
+        return "FAILED"
+    return "PENDING"
 
 
 class PawaPayCallbackView(APIView):
     """Callback (webhook) PawaPay : réception du statut final d'un dépôt, idempotent.
 
     Le corps suit le format réel (docs.pawapay.io) : {depositId, status, customerMessage, ...}.
-    Retourne toujours 200 si l'événement est accepté (PawaPay le considère livré).
+    Le callback ne fait que DÉCLENCHER une vérification : le statut et le montant sont relus
+    chez PawaPay avant tout crédit. Retourne 200 dès que l'événement est enregistré.
     """
 
     authentication_classes = []
@@ -646,11 +747,16 @@ class PawaPayCallbackView(APIView):
             defaults={"provider": "PAWAPAY", "status": status_val, "payload": body},
         )
 
-        if status_val in ("COMPLETED", "SUCCESSFUL"):
-            recharge = pending_recharge_by_reference(deposit_id)
-            if recharge is not None:
-                complete_pending_recharge(recharge)
-        return Response({"received": True}, status=status.HTTP_200_OK)
+        recharge = pending_recharge_by_reference(deposit_id)
+        if recharge is None or not os.getenv("PAWAPAY_SANDBOX_TOKEN", ""):
+            return Response({"received": True, "verified": False}, status=status.HTTP_200_OK)
+        try:
+            _, data = _pawapay_fetch_deposit(deposit_id)
+        except Exception:  # pragma: no cover - dépend du réseau
+            # PawaPay injoignable : la recharge reste en attente, le polling de statut la complétera.
+            return Response({"received": True, "verified": False}, status=status.HTTP_200_OK)
+        outcome = _settle_pawapay_deposit(recharge, data)
+        return Response({"received": True, "verified": outcome != "PENDING", "outcome": outcome}, status=status.HTTP_200_OK)
 
 
 class PawaPayDepositStatusView(APIView):
@@ -669,38 +775,33 @@ class PawaPayDepositStatusView(APIView):
         if recharge is None:
             return Response({"detail": "Dépôt introuvable pour cet abonné."}, status=status.HTTP_404_NOT_FOUND)
 
-        token = os.getenv("PAWAPAY_SANDBOX_TOKEN", "")
-        if not token:
-            return Response({"detail": "PawaPay non configuré : aucun token sandbox."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        try:
-            status_code, body = _http_get_json(
-                f"{PAWAPAY_SANDBOX_DEPOSITS}/{deposit_id}",
-                {"Authorization": f"Bearer {token}"},
-            )
-        except Exception as exc:  # pragma: no cover - dépend du réseau
-            return Response({"detail": f"Échec de la vérification du statut PawaPay : {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+        result = {"deposit_id": deposit_id, "status": recharge.status}
+        # Déjà soldée (par le callback, par exemple) : inutile de réinterroger PawaPay.
+        if recharge.status == Recharge.STATUS_PENDING:
+            if not os.getenv("PAWAPAY_SANDBOX_TOKEN", ""):
+                return Response({"detail": "PawaPay non configuré : aucun token sandbox."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            try:
+                status_code, data = _pawapay_fetch_deposit(deposit_id)
+            except Exception as exc:  # pragma: no cover - dépend du réseau
+                return Response({"detail": f"Échec de la vérification du statut PawaPay : {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+            outcome = _settle_pawapay_deposit(recharge, data)
+            result.update({
+                "http_status": status_code,
+                "status": str(data.get("status") or "").upper(),
+                "customer_message": data.get("customerMessage", ""),
+                "provider_transaction_id": data.get("providerTransactionId", ""),
+            })
+            if outcome == "MISMATCH":
+                result["failed"] = True
+                result["detail"] = "Le montant confirmé par PawaPay ne correspond pas à la recharge demandée. Aucun crédit n'a été ajouté ; contactez le support."
+            recharge.refresh_from_db()
 
-        data = body.get("data", body) if isinstance(body, dict) else {}
-        if not isinstance(data, dict):
-            data = {}
-        deposit_status = str(data.get("status") or body.get("status") or "").upper()
-        result = {
-            "deposit_id": deposit_id,
-            "http_status": status_code,
-            "status": deposit_status,
-            "customer_message": data.get("customerMessage", "") if isinstance(data, dict) else "",
-            "provider_transaction_id": data.get("providerTransactionId", "") if isinstance(data, dict) else "",
-        }
-        if deposit_status in ("COMPLETED", "SUCCESSFUL") and recharge.status != Recharge.STATUS_APPLIED:
-            complete_pending_recharge(recharge)
-            result["applied"] = True
-            result["recharge_id"] = recharge.id
+        if recharge.status == Recharge.STATUS_APPLIED:
             meter.refresh_from_db()
-            result["balance_kwh"] = float(meter.balance_kwh)
-        elif deposit_status in ("FAILED", "REJECTED"):
-            recharge.status = Recharge.STATUS_FAILED
-            recharge.save(update_fields=["status"])
+            result.update({"applied": True, "recharge_id": recharge.id, "balance_kwh": float(meter.balance_kwh)})
+        elif recharge.status == Recharge.STATUS_FAILED:
             result["failed"] = True
+            result.setdefault("detail", "Paiement refusé par le réseau.")
         return Response(result)
 
 
@@ -772,19 +873,17 @@ class AdminOverviewView(APIView):
         total = Meter.objects.count()
         online = Meter.objects.filter(device_status="ONLINE").count()
         low_balance = Meter.objects.filter(balance_kwh__lt=5).count()
-        # Calcul réel par secteur
-        from .models import Sector as SectorModel
-        sector_rows = []
-        for sector in SectorModel.objects.all():
-            meters = sector.meters.all()
-            sector_rows.append({
-                "name": sector.name,
-                "territory": sector.territory,
-                "online": meters.filter(device_status="ONLINE").count(),
-                "offline": meters.filter(device_status="OFFLINE").count(),
-                "total": meters.count(),
-            })
-        open_alerts = sum(meter.alerts.filter(acknowledged_at__isnull=True).count() for meter in Meter.objects.all())
+        # Calcul réel par secteur (agrégé en base)
+        sectors = Sector.objects.annotate(
+            total=Count("meters"),
+            online=Count("meters", filter=Q(meters__device_status="ONLINE")),
+            offline=Count("meters", filter=Q(meters__device_status="OFFLINE")),
+        ).order_by("name")
+        sector_rows = [
+            {"name": sector.name, "territory": sector.territory, "online": sector.online, "offline": sector.offline, "total": sector.total}
+            for sector in sectors
+        ]
+        open_alerts = Alert.objects.filter(acknowledged_at__isnull=True).count()
         return Response({
             "totalMeters": total,
             "onlineMeters": online,
@@ -940,6 +1039,7 @@ class DashboardViewSet(viewsets.ViewSet):
         consumption_weekly = weekly_consumption_breakdown(week_rows)
 
         budget = getattr(meter, "budget", None)
+        credit = credit_status(meter)
         last_telemetry = meter.telemetry.order_by("-applied_at").first()
         return Response({
             "mode": "DEMO" if meter.is_demo else "PERSISTED",
@@ -950,6 +1050,10 @@ class DashboardViewSet(viewsets.ViewSet):
                           "energy_consumed": float(meter.energy_kwh)},
             "balance": {"kwh": float(meter.balance_kwh), "cdf": float(meter.balance_kwh * CDF_PER_KWH), "usd": float(meter.balance_kwh * USD_PER_KWH)},
             "cdf_per_usd": float(CDF_PER_USD),
+            "tariff": {"cdf_per_kwh": float(CDF_PER_KWH), "usd_per_kwh": float(USD_PER_KWH)},
+            "credit": {"percent": credit["percent"], "reference_kwh": credit["reference_kwh"],
+                       "threshold": credit["threshold"], "thresholds": list(CREDIT_THRESHOLDS)},
+            "notifications": notification_channels(meter),
             "estimate_hours": estimate_hours(meter),
             "consumption": consumption,
             "consumption_daily": consumption_daily,
@@ -963,12 +1067,79 @@ class DashboardViewSet(viewsets.ViewSet):
                 for recharge in meter.recharges.filter(status=Recharge.STATUS_APPLIED).order_by("-applied_at")[:10]
             ],
             "alerts": [
-                {"kind": alert.kind, "severity": alert.severity, "message": alert.message, "created_at": alert.created_at.isoformat()}
+                {"id": alert.id, "kind": alert.kind, "severity": alert.severity, "message": alert.message, "created_at": alert.created_at.isoformat()}
                 for alert in meter.alerts.filter(acknowledged_at__isnull=True)[:10]
             ],
             "last_telemetry_at": last_telemetry.applied_at.isoformat() if last_telemetry else None,
             "relay_command": {"id": pending_command.id, "desired_state": pending_command.requested_state, "status": pending_command.status} if pending_command else None,
         })
+
+
+class AlertAcknowledgeView(APIView):
+    """L'abonné marque une alerte comme lue : elle quitte la liste des alertes ouvertes."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, alert_id: int):
+        meter = subscriber_meter_for(request.user)
+        if not meter:
+            return Response({"detail": "Aucun compteur n'est associé à cet abonné."}, status=status.HTTP_403_FORBIDDEN)
+        updated = meter.alerts.filter(pk=alert_id, acknowledged_at__isnull=True).update(acknowledged_at=timezone.now())
+        if not updated and not meter.alerts.filter(pk=alert_id).exists():
+            return Response({"detail": "Alerte introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        notify_telemetry_refresh(meter)
+        return Response({"acknowledged": True, "open_alerts": meter.alerts.filter(acknowledged_at__isnull=True).count()})
+
+
+class SubscriberProfileView(APIView):
+    """Coordonnées de contact de l'abonné (destinataires des alertes) et état des canaux."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _payload(self, meter) -> dict:
+        return {**_subscriber_payload(meter), "channels": notification_channels(meter)}
+
+    def get(self, request):
+        meter = subscriber_meter_for(request.user)
+        if not meter:
+            return Response({"detail": "Aucun compteur n'est associé à cet abonné."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(self._payload(meter))
+
+    def post(self, request):
+        meter = subscriber_meter_for(request.user)
+        if not meter:
+            return Response({"detail": "Aucun compteur n'est associé à cet abonné."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = SubscriberProfileSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        fields = []
+        for name in ("email", "phone", "address"):
+            if name in serializer.validated_data:
+                setattr(meter, f"subscriber_{name}", serializer.validated_data[name])
+                fields.append(f"subscriber_{name}")
+        if fields:
+            meter.save(update_fields=fields)
+        return Response(self._payload(meter))
+
+
+class NotificationTestView(APIView):
+    """Envoie un message d'essai sur les canaux prêts et rapporte le résultat réel de chacun."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "notification_test"
+
+    def post(self, request):
+        meter = subscriber_meter_for(request.user)
+        if not meter:
+            return Response({"detail": "Aucun compteur n'est associé à cet abonné."}, status=status.HTTP_403_FORBIDDEN)
+        credit = credit_status(meter)
+        level = f"{credit['percent']:.0f} %" if credit["percent"] is not None else "inconnu"
+        results = send_notification(
+            meter,
+            f"Virunga Smart Energy — message d'essai (compteur {meter.meter_id})",
+            f"Message d'essai Virunga Smart Energy. Compteur {meter.meter_id} : solde {Decimal(str(meter.balance_kwh)):.2f} kWh, niveau de crédit {level}.",
+        )
+        return Response({"results": results})
 
 
 class RelayCommandView(APIView):
@@ -981,6 +1152,8 @@ class RelayCommandView(APIView):
         if not meter:
             return Response({"detail": "Aucun compteur n'est associé à cet abonné."}, status=status.HTTP_403_FORBIDDEN)
         desired_state = serializer.validated_data["desired_state"]
+        if desired_state == RelayCommand.ON and meter.balance_kwh <= 0:
+            return Response({"detail": "Solde épuisé : rechargez votre crédit pour rétablir le courant."}, status=status.HTTP_409_CONFLICT)
         with transaction.atomic():
             meter.relay_commands.filter(status=RelayCommand.PENDING).update(status=RelayCommand.SUPERSEDED)
             command = RelayCommand.objects.create(meter=meter, requested_state=desired_state, requested_by=request.user.username)
@@ -1001,20 +1174,18 @@ class NewsViewSet(viewsets.ModelViewSet):
             return queryset
         return queryset.filter(is_published=True)
 
-    def perform_create(self, serializer):
+    def _require_staff(self):
         if not self.request.user.is_staff:
-            from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Accès administrateur requis.")
+
+    def perform_create(self, serializer):
+        self._require_staff()
         serializer.save()
 
     def perform_update(self, serializer):
-        if not self.request.user.is_staff:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Accès administrateur requis.")
+        self._require_staff()
         serializer.save()
 
     def perform_destroy(self, instance):
-        if not self.request.user.is_staff:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Accès administrateur requis.")
+        self._require_staff()
         instance.delete()

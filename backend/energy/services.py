@@ -18,10 +18,12 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
+from django.db.models import Max, Q
 from django.utils import timezone
 
-from .models import Alert, ManualToken, Meter, Recharge
+from .models import Alert, ManualToken, Meter, Recharge, RelayCommand
 
 # ---------------------------------------------------------------------------
 # Bornes physiques et seuils (contrat du prompt d'ingénierie)
@@ -38,6 +40,10 @@ HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 STALE_WINDOW = timedelta(minutes=10)
 FUTURE_WINDOW = timedelta(minutes=5)
 ALERT_DEDUP_WINDOW = timedelta(minutes=15)
+# Alertes dégressives : part du crédit restant par rapport au niveau atteint après la
+# dernière recharge. Chaque seuil ne déclenche qu'une alerte par cycle de recharge.
+CREDIT_THRESHOLDS = (15, 10, 5, 3, 1)
+CREDIT_REFERENCE_FALLBACK_WINDOW = timedelta(days=30)
 CDF_PER_KWH = Decimal("2500")            # tarif : prix de 1 kWh en francs congolais (FC)
 CDF_PER_USD = Decimal("2500")            # taux de change officiel : 1 USD = 2500 FC
 USD_PER_KWH = CDF_PER_KWH / CDF_PER_USD  # tarif en USD, cohérent avec le taux (1 kWh = 1 USD)
@@ -111,9 +117,23 @@ def parse_manual_token(token: str) -> tuple[dict | None, str | None]:
 # ---------------------------------------------------------------------------
 # Recharge et règle de relais automatique
 # ---------------------------------------------------------------------------
+def desired_relay_state(meter: Meter) -> str:
+    """État voulu du relais : le solde prime, puis la dernière commande de l'abonné.
+
+    Solde épuisé -> OFF, toujours. Sinon, un isolement demandé par l'abonné reste
+    en vigueur tant qu'il n'a pas lui-même demandé le rétablissement.
+    """
+    if meter.balance_kwh <= 0:
+        return RelayCommand.OFF
+    last_command = meter.relay_commands.exclude(status=RelayCommand.SUPERSEDED).first()
+    if last_command is not None and last_command.requested_state == RelayCommand.OFF:
+        return RelayCommand.OFF
+    return RelayCommand.ON
+
+
 def apply_relay_rule(meter: Meter) -> str:
-    """Coupure automatique si solde <= 0, rétablissement si solde > 0."""
-    desired = "OFF" if meter.balance_kwh <= 0 else "ON"
+    """Coupure automatique si solde <= 0, rétablissement si solde > 0 (hors isolement demandé)."""
+    desired = desired_relay_state(meter)
     if meter.relay_status != desired:
         meter.relay_status = desired
         meter.save(update_fields=["relay_status", "updated_at"])
@@ -135,11 +155,43 @@ def apply_recharge(meter: Meter, source: str, energy_kwh, applied_at, provider_r
     return recharge
 
 
+def pending_credits(meter: Meter, acked_ids=()) -> list[Recharge]:
+    """Recharges appliquées côté serveur que le compteur n'a pas encore confirmées.
+
+    Le compteur rapporte son solde local dans chaque télémétrie ; sans cette
+    étape, la télémétrie suivant une recharge écraserait le solde crédité.
+    Chaque crédit est renvoyé dans la réponse jusqu'à ce que le compteur
+    l'accuse (``credit_acks``) : une réponse perdue ne fait donc perdre aucun
+    crédit, et l'identifiant évite de l'appliquer deux fois.
+    """
+    undelivered = meter.recharges.filter(status=Recharge.STATUS_APPLIED, delivered_at__isnull=True)
+    if acked_ids:
+        undelivered.filter(id__in=list(acked_ids)).update(delivered_at=timezone.now())
+    return list(undelivered.order_by("id"))
+
+
 def pending_recharge_by_reference(reference: str, meter: Meter | None = None) -> Recharge | None:
     queryset = Recharge.objects.filter(provider_reference=reference, status=Recharge.STATUS_PENDING)
     if meter is not None:
         queryset = queryset.filter(meter=meter)
     return queryset.first()
+
+
+def payment_covers_recharge(recharge: Recharge, amount, currency) -> bool:
+    """Le montant confirmé par le prestataire couvre-t-il l'énergie de la recharge ?
+
+    Empêche de créditer une recharge sur la foi d'un paiement d'un montant
+    inférieur ou d'une autre devise que celle attendue (CDF ou USD).
+    """
+    try:
+        paid = Decimal(str(amount))
+    except (ArithmeticError, ValueError, TypeError):
+        return False
+    rate = {"CDF": CDF_PER_KWH, "USD": USD_PER_KWH}.get(str(currency or "").upper())
+    if rate is None:
+        return False
+    # Tolérance d'un centime : le montant USD est arrondi à 2 décimales à l'initiation.
+    return paid + Decimal("0.01") >= recharge.energy_kwh * rate
 
 
 def complete_pending_recharge(recharge: Recharge, applied_at=None) -> Recharge:
@@ -169,19 +221,52 @@ def _consumption_last_24h(meter: Meter) -> Decimal:
     return Decimal(str(max(rows))) - Decimal(str(min(rows)))
 
 
-def detect_anomalies(meter: Meter, data: dict) -> list[Alert]:
+def credit_status(meter: Meter) -> dict:
+    """Niveau du crédit prépayé en pourcentage du crédit de référence.
+
+    La référence est le solde le plus haut observé depuis la dernière recharge
+    appliquée (à défaut, sur 30 jours) : c'est le « plein » du cycle en cours.
+    Elle est déduite des télémétries — aucun champ supplémentaire en base — et
+    gardée en cache pour ne pas relire l'historique à chaque télémétrie.
+    """
+    last_recharge = meter.recharges.filter(status=Recharge.STATUS_APPLIED).order_by("-applied_at").first()
+    since = last_recharge.applied_at if last_recharge else timezone.now() - CREDIT_REFERENCE_FALLBACK_WINDOW
+    balance = Decimal(str(meter.balance_kwh))
+    cache_key = f"credit-reference:{meter.pk}:{last_recharge.pk if last_recharge else 0}"
+    reference = cache.get(cache_key)
+    if reference is None:
+        reference = meter.telemetry.filter(applied_at__gte=since).aggregate(peak=Max("balance_kwh"))["peak"] or Decimal("0")
+    reference = max(Decimal(str(reference)), balance)
+    cache.set(cache_key, str(reference), 7 * 24 * 3600)
+
+    percent = float(balance / reference * 100) if reference > 0 else None
+    crossed = [threshold for threshold in CREDIT_THRESHOLDS if percent is not None and percent <= threshold]
+    return {
+        "reference_kwh": float(reference),
+        "percent": round(percent, 1) if percent is not None else None,
+        # Seuil le plus bas franchi (le plus urgent), ou None au-dessus de 15 %.
+        "threshold": min(crossed) if crossed else None,
+        "since": since,
+    }
+
+
+def detect_anomalies(meter: Meter, data: dict | None = None) -> list[Alert]:
     """Crée des Alert pour les anomalies détectées sur la télémétrie reçue.
 
     Une alerte du même type déjà ouverte (non acquittée) depuis moins de
     ``ALERT_DEDUP_WINDOW`` n'est pas recréée : évite le bruit à chaque
-    télémétrie de 5 secondes.
+    télémétrie de 5 secondes. Sans ``data`` (ex. changement de plafond), seuls
+    le solde et le budget sont réévalués.
     """
+    data = data or {}
     created: list[Alert] = []
     voltage = data.get("voltage")
     power = data.get("power")
     dedup_threshold = timezone.now() - ALERT_DEDUP_WINDOW
+    # Pas de doublon tant qu'une alerte du même type est ouverte, ni dans les 15 minutes
+    # qui suivent (sinon une alerte acquittée renaîtrait à la télémétrie suivante).
     open_kinds = set(
-        meter.alerts.filter(acknowledged_at__isnull=True, created_at__gte=dedup_threshold)
+        meter.alerts.filter(Q(acknowledged_at__isnull=True) | Q(created_at__gte=dedup_threshold))
         .values_list("kind", flat=True)
     )
 
@@ -201,6 +286,18 @@ def detect_anomalies(meter: Meter, data: dict) -> list[Alert]:
         add("SOLDE_BAS", "WARNING", f"Solde bas : {meter.balance_kwh} kWh restants.")
     if meter.balance_kwh <= 0:
         add("SOLDE_EPUISE", "CRITICAL", "Solde épuisé : courant coupé automatiquement.")
+
+    # Alertes dégressives 15 / 10 / 5 / 3 / 1 % : une seule par seuil et par cycle de recharge.
+    credit = credit_status(meter)
+    if credit["threshold"] is not None:
+        kind = f"CREDIT_SEUIL_{credit['threshold']}"
+        if not meter.alerts.filter(kind=kind, created_at__gte=credit["since"]).exists():
+            severity = "CRITICAL" if credit["threshold"] <= 5 else "WARNING"
+            created.append(Alert.objects.create(
+                meter=meter, kind=kind, severity=severity,
+                message=(f"Crédit à {credit['percent']:.0f} % (seuil {credit['threshold']} %) : il vous reste "
+                         f"{Decimal(str(meter.balance_kwh)):.2f} kWh. Pensez à recharger."),
+            ))
 
     budget = getattr(meter, "budget", None)
     if budget is not None and budget.limit_kwh > 0:
@@ -253,7 +350,7 @@ def generate_receipt_pdf(recharge: Recharge, meter: Meter, subscriber_name: str 
         ("VIRUNGA SMART ENERGY — REÇU DE RECHARGE", 14, True),
         ("Simulation academique independante — source d'inspiration : Virunga Energies", 9, False),
         ("", 10, False),
-        ("Recharge n°", 10, True),
+        (f"Recharge n° {recharge.id}", 10, True),
         (f"Compteur : {meter.meter_id}", 10, False),
         (f"Abonne : {subscriber_name or (meter.subscriber_first_name + ' ' + meter.subscriber_last_name).strip()}", 10, False),
         (f"Source : {recharge.source}", 10, False),
