@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0a2e22"/><stop offset="1" stop-color="#021b14"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <g fill="#134e3a" opacity="0.45">
+    <circle cx="150" cy="140" r="2"/><circle cx="480" cy="90" r="2"/><circle cx="820" cy="180" r="2"/><circle cx="1180" cy="110" r="2"/><circle cx="1450" cy="160" r="2"/>
+  </g>
+  <!-- meter body -->
+  <g transform="translate(700 200)">
+    <rect x="0" y="0" width="220" height="360" rx="34" fill="#022c22" stroke="#a3e635" stroke-width="8"/>
+    <rect x="26" y="36" width="168" height="150" rx="16" fill="#0b3d2e" stroke="#86efac" stroke-width="4"/>
+    <text x="110" y="138" fill="#bef264" font-family="DejaVu Sans, Arial, sans-serif" font-size="78" font-weight="800" text-anchor="middle">129</text>
+    <!-- bolt -->
+    <path d="M110 210 L86 268 h34 l-26 58 66 -46 h-36 l40 -70z" fill="#bef264"/>
+    <!-- led / signal bars -->
+    <g stroke="#4d7c0f" stroke-width="6" stroke-linecap="round">
+      <path d="M40 308 v22"/><path d="M74 300 v30"/><path d="M108 292 v38"/><path d="M142 296 v34"/>
+    </g>
+  </g>
+  <!-- radio waves -->
+  <g stroke="#4d7c0f" stroke-width="6" fill="none" opacity="0.7" stroke-linecap="round">
+    <path d="M340 620 q120 -90 0 -180"/>
+    <path d="M440 640 q170 -130 0 -260"/>
+    <path d="M540 660 q220 -170 0 -340" opacity="0.4"/>
+  </g>
+  <text x="80" y="820" fill="#d9f99d" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" font-weight="700" letter-spacing="6">VIRUNGA ENERGIES</text>
+  <text x="82" y="860" fill="#86efac" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" letter-spacing="4">COMPTEUR INTELLIGENT · PRÉPAYÉ</text>
+</svg>

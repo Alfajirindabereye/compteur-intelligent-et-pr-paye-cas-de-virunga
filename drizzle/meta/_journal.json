@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1786785601008,
+      "tag": "0000_sturdy_bucky",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1786785714227,
+      "tag": "0001_salty_firedrake",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1786786356546,
+      "tag": "0002_chunky_silverclaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1786792107150,
+      "tag": "0003_flimsy_mattie_franklin",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1786792393347,
+      "tag": "0004_regular_war_machine",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1786793094826,
+      "tag": "0005_workable_paladin",
+      "breakpoints": true
+    }
+  ]
+}

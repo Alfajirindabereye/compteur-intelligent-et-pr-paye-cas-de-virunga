@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `domainRole` enum('abonne','administrateur') DEFAULT 'abonne' NOT NULL;

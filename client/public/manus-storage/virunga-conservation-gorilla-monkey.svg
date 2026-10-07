@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b3d2e"/><stop offset="1" stop-color="#01251b"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <g fill="#134e3a" opacity="0.45">
+    <circle cx="140" cy="120" r="2"/><circle cx="520" cy="80" r="2"/><circle cx="980" cy="150" r="2"/><circle cx="1400" cy="100" r="2"/><circle cx="760" cy="220" r="2"/>
+  </g>
+  <!-- gorilla silhouette -->
+  <g fill="#86efac" opacity="0.95">
+    <path d="M780 300 q-30 0 -44 22 q-30 10 -34 44 l-2 40 q-2 26 14 30 l6 66 q4 30 22 34 l40 190 h48 l6 -120 h20 l6 120 h48 l40 -190 q18 -4 22 -34 l6 -66 q16 -4 14 -30 l-2 -40 q-4 -34 -34 -44 q-14 -22 -44 -22 q-34 -18 -66 0z"/>
+  </g>
+  <!-- face -->
+  <g fill="#022c22">
+    <ellipse cx="748" cy="360" rx="12" ry="16"/><ellipse cx="832" cy="360" rx="12" ry="16"/>
+    <path d="M762 430 q30 20 58 0" fill="none" stroke="#022c22" stroke-width="10" stroke-linecap="round"/>
+  </g>
+  <!-- forest line -->
+  <g stroke="#4d7c0f" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.75">
+    <path d="M180 720 q40 -60 80 0 q40 -60 80 0 q40 -60 80 0 q40 -60 80 0"/>
+    <path d="M1180 720 q40 -60 80 0 q40 -60 80 0 q40 -60 80 0 q40 -60 80 0"/>
+    <path d="M960 720 q40 -70 80 0 q40 -70 80 0 q40 -70 80 0"/>
+  </g>
+  <text x="80" y="820" fill="#d9f99d" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" font-weight="700" letter-spacing="6">VIRUNGA ENERGIES</text>
+  <text x="82" y="860" fill="#86efac" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" letter-spacing="4">CONSERVATION · PARC NATIONAL DES VIRUNGA</text>
+</svg>

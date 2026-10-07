@@ -1,0 +1,8 @@
+Django==5.1.8
+djangorestframework==3.15.2
+channels==4.2.0
+channels-redis==4.2.1
+daphne==4.1.2
+PyJWT==2.10.1
+cryptography==44.0.1
+# PostgreSQL (uniquement après la phase Business terminée) : ajouter psycopg2-binary

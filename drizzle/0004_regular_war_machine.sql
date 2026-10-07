@@ -1,0 +1,1 @@
+ALTER TABLE `meters` ADD `ownerOpenId` varchar(64);

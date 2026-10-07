@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b3d2e"/><stop offset="1" stop-color="#022c22"/>
+    </linearGradient>
+    <linearGradient id="sun" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9f99d"/><stop offset="1" stop-color="#4d7c0f"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <g fill="#134e3a" opacity="0.45">
+    <circle cx="120" cy="120" r="2"/><circle cx="360" cy="80" r="2"/><circle cx="600" cy="150" r="2"/>
+    <circle cx="880" cy="90" r="2"/><circle cx="1120" cy="140" r="2"/><circle cx="1380" cy="70" r="2"/>
+    <circle cx="240" cy="300" r="2"/><circle cx="520" cy="250" r="2"/><circle cx="900" cy="320" r="2"/>
+  </g>
+  <circle cx="1180" cy="300" r="120" fill="url(#sun)" opacity="0.85"/>
+  <g stroke="#bef264" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M80 720 L520 300 L760 560 L1020 250 L1520 720 Z"/>
+    <path d="M300 720 L620 460 L840 650 L1160 400 L1440 720" stroke-width="7" stroke="#a3e635" opacity="0.9"/>
+  </g>
+  <g stroke="#4d7c0f" stroke-width="6" fill="none" opacity="0.75">
+    <path d="M200 560 q40 -40 80 0 q0 40 -40 40 q-40 0 -40 -40z"/>
+    <path d="M1330 560 q40 -40 80 0 q0 40 -40 40 q-40 0 -40 -40z"/>
+  </g>
+  <text x="80" y="820" fill="#d9f99d" font-family="DejaVu Sans, Arial, sans-serif" font-size="34" font-weight="700" letter-spacing="6">VIRUNGA ENERGIES</text>
+  <text x="82" y="860" fill="#86efac" font-family="DejaVu Sans, Arial, sans-serif" font-size="20" letter-spacing="4">NORD-KIVU · RUTSHURU · MATEBE</text>
+</svg>
